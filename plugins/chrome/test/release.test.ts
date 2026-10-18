@@ -3,6 +3,12 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
 import { expect, it } from 'vitest'
+it('pins the platform-neutral gzip header bytes', () => {
+  const folder = process.env.BROCREW_CHROME_TEST_ARTIFACT
+  expect(folder).toBeTruthy()
+  const bytes = fs.readFileSync(path.join(folder!, 'chrome-darwin-arm64.tar.gz'))
+  expect([...bytes.subarray(0, 10)]).toEqual([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 2, 255])
+})
 it('publishes exactly the built archive and its fixed repository pins', () => {
   const folder = process.env.BROCREW_CHROME_TEST_ARTIFACT
   expect(folder).toBeTruthy()

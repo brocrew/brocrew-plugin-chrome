@@ -8,6 +8,8 @@ const commit = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).
 const out = path.resolve(process.argv[2] ?? 'artifact')
 const release = await buildChromePackage(out, commit)
 const bytes = gzipSync(fs.readFileSync(path.join(out, 'chrome.tar')), { level: 9 })
+// zlib emits a host-specific OS byte. Canonicalize it; payload and trailer stay unchanged.
+bytes[9] = 255
 const name = 'chrome-darwin-arm64.tar.gz'
 fs.writeFileSync(path.join(out, name), bytes)
 const entry = {
