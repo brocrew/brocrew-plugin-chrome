@@ -1,0 +1,43 @@
+name: Chrome release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release:
+    if: github.repository == 'brocrew/brocrew-plugin-chrome' && github.event.repository.private == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.23.3'
+      - run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
+      - run: npm ci --prefix plugins/chrome --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build -- artifact
+      - run: npm test
+        env:
+          BROCREW_CHROME_TEST_ARTIFACT: ${{ github.workspace }}/artifact
+      - run: node scripts/leak-check.mjs
+        env:
+          BROBOT_LEAK_PATTERNS: ${{ secrets.BROBOT_LEAK_PATTERNS }}
+      - name: Attach verified archives to the private release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: brocrew/brocrew-plugin-chrome
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          test "$(gh api repos/brocrew/brocrew-plugin-chrome --jq .private)" = true
+          test "$TAG" = "v$(node -p "require('./plugins/chrome/manifest-template.json').version")"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes 'Chrome plugin for BroCrew'
+          gh release upload "$TAG" artifact/chrome-darwin-arm64.tar.gz artifact/plugin-list-entry.json

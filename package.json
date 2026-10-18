@@ -1,0 +1,17 @@
+{
+  "name": "brocrew-plugin-chrome",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node scripts/release.mjs",
+    "test": "vitest run --config plugins/chrome/vitest.config.ts",
+    "typecheck": "tsc --noEmit -p plugins/chrome/tsconfig.json"
+  },
+  "devDependencies": {
+    "vitest": "4.1.10",
+    "typescript": "5.9.3",
+    "@types/node": "22.19.15"
+  }
+}
