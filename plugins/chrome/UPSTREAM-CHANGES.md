@@ -37,3 +37,5 @@ Paths on the left are below `servers/`; destinations are relative to `plugins/ch
 ## BroCrew adaptations retained
 
 Every download remains under private staging; CDP stays allowAndName in both modes. There is no OS Downloads fallback. The explicit private data/config roots, separate person/tool authentication, authenticated readiness, host-owned executable, IPC receipt, exact-run exit proof and removed person-step records are unchanged. A new invalid all-default launch uses only the already approved “Plugin unavailable. Try again.” wording. No product UI or tool description is changed.
+
+The server runtime version comes from manifest-template.json, the same release metadata used by the builder. The shared MCP factory requires an explicit version, with no literal fallback. Built-archive health and MCP initialization are checked against the emitted manifest; the app-only integration also runs the real Node host through ready and exact-run exit with an inert browser.

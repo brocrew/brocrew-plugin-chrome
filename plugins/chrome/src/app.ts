@@ -19,7 +19,8 @@ import type { WindowTasks } from './windows.js'
 import { TabRegistry } from './tabs.js'
 import { createProfileOpener } from './openWindow.js'
 import { createAgentChromeTools } from './tools/index.js'
-export const VERSION = '0.1.0'
+import releaseMetadata from '../manifest-template.json' with { type: 'json' }
+export const VERSION = releaseMetadata.version
 const ALLOWED_HOSTS = ['localhost', '127.0.0.1', '[::1]']
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1'])
 export interface AppDeps {

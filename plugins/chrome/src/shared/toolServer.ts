@@ -38,14 +38,14 @@ export interface StaticResource {
 }
 export interface ToolServerOptions {
   name: string
-  version?: string
+  version: string
   tools: ToolHandler[]
   resources?: StaticResource[]
   context?: Record<string, unknown>
   customize?: (server: Server) => void
 }
 export function createToolServer(options: ToolServerOptions): Server {
-  const { name, version = '1.0.0', tools, resources = [], context = {} } = options
+  const { name, version, tools, resources = [], context = {} } = options
   const capabilities: Record<string, Record<string, never>> = { tools: {} }
   if (resources.length > 0) {
     capabilities.resources = {}

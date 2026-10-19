@@ -8,8 +8,8 @@
       "source": "agent-chrome/src/app.ts",
       "destination": "plugins/chrome/src/app.ts",
       "sourceSha256": "b11111e45b64025d899f3ca3ae9c7d4fee82ad8a83ef7756c8de10179c19c601",
-      "changes": "local shared imports; explicit private file root; separate person auth; authenticated readiness; typed tabs; removed person-step records; comments/client references removed",
-      "destinationSha256": "2d067e4ec8464368a8abb7a118411f1fe928fd6b55efe6c73fb9c1dcfeb57ede"
+      "changes": "local shared imports; explicit private file root; separate person auth; authenticated readiness; typed tabs; removed person-step records; comments/client references removed; runtime version derives from release manifest metadata, no shared literal fallback",
+      "destinationSha256": "d02af49af74ac41ae5c98259e62e562e06b6621f42162aa04f3a81be9e28a5b0"
     },
     {
       "source": "agent-chrome/src/browser/chromeBrowser.ts",
@@ -211,8 +211,8 @@
       "source": "shared/src/toolServer.ts",
       "destination": "plugins/chrome/src/shared/toolServer.ts",
       "sourceSha256": "50f904ca8d90b6000b2b0884a15ecf6d60c97974b2c05133a8bc1107c6669f5c",
-      "changes": "local imports preserved; comments and client references removed",
-      "destinationSha256": "8a943b8ac0acccc6c6bbd58ba6808771244abb8199831890a1560fc2c16a68a0"
+      "changes": "local imports preserved; comments and client references removed; runtime version derives from release manifest metadata, no shared literal fallback",
+      "destinationSha256": "eb9cd938673ff23dee812dc07dd902203de4d594fd9cf8e54963b77c40fb63bf"
     },
     {
       "source": "shared/src/httpMcpServer.ts",

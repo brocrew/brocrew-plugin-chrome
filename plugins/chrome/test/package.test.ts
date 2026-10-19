@@ -1,11 +1,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { loadConfig } from '../src/config.js'
-import { startAgentChrome } from '../src/app.js'
+import { startAgentChrome, VERSION } from '../src/app.js'
 import { createProfileStore } from '../src/profiles/store.js'
 import { silentLogger } from '../src/logger.js'
 import { FakeBrowser, FakePage, asPage } from './fakes.js'
@@ -37,11 +38,11 @@ function configured() {
   fs.writeFileSync(authPath, JSON.stringify({ mcpToken, adminToken }), { mode: 0o600 })
   return loadConfig({ BROCREW_CHROME_DATA: home, BROCREW_CHROME_AUTH: authPath })
 }
-async function boot() {
+async function boot(start = startAgentChrome) {
   const config = configured(),
     store = createProfileStore({ home: config.home }),
     browser = new FakeBrowser(store.dirOf)
-  const server = await startAgentChrome(config, { browser, store, logger: silentLogger })
+  const server = await start(config, { browser, store, logger: silentLogger })
   cleanup.push(() => server.close())
   const port = (server.httpServer.address() as { port: number }).port
   const url = `http://127.0.0.1:${port}`
@@ -60,6 +61,41 @@ async function boot() {
   return { config, store, browser, server, url, request }
 }
 describe('private Chrome package', () => {
+  it('derives the server version from release metadata and contains no literal server-version fallback', () => {
+    const metadata = JSON.parse(fs.readFileSync('plugins/chrome/manifest-template.json', 'utf8'))
+    expect(VERSION).toBe(metadata.version)
+    const inspect = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const file = path.join(directory, entry.name)
+        if (entry.isDirectory()) inspect(file)
+        else if (entry.name.endsWith('.ts'))
+          expect(fs.readFileSync(file, 'utf8')).not.toMatch(
+            /['"`]\d+\.\d+\.\d+(?:[-+][^'"`\s]+)?['"`]/,
+          )
+      }
+    }
+    inspect('plugins/chrome/src')
+  })
+  it('the built archive reports exactly its manifest version in authenticated health and MCP initialization', async () => {
+    const artifact = process.env.BROCREW_CHROME_TEST_ARTIFACT
+    expect(artifact, 'Build a fresh artifact and set BROCREW_CHROME_TEST_ARTIFACT').toBeTruthy()
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(artifact!, 'package/plugin.json'), 'utf8'),
+    )
+    const built = await import(pathToFileURL(path.join(artifact!, 'package/server.mjs')).href)
+    const { url, request } = await boot(built.startAgentChrome)
+    const health = await request('/healthz', adminToken)
+    expect(health.status).toBe(200)
+    expect.soft(health.body).toMatchObject({ ok: true, version: manifest.version })
+    const client = new Client({ name: 'fictional-release-version', version: '1' })
+    cleanup.push(() => client.close())
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(url + '/mcp'), {
+        requestInit: { headers: { Authorization: `Bearer ${mcpToken}` } },
+      }),
+    )
+    expect(client.getServerVersion()?.version).toBe(manifest.version)
+  })
   it('requires explicit private paths and distinct private auth, with no workspace fallback', () => {
     expect(() => loadConfig({})).toThrow('Plugin unavailable')
     expect(() => loadConfig({ BROCREW_CHROME_DATA: 'relative' })).toThrow('Plugin unavailable')
