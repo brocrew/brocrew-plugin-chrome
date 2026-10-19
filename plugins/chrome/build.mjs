@@ -151,7 +151,7 @@ export async function buildChromePackage(
     JSON.stringify(
       {
         name: '@brocrew/chrome-plugin',
-        version: '0.1.0',
+        version: JSON.parse(fs.readFileSync(path.join(root, 'manifest-template.json'))).version,
         type: 'module',
         dependencies: { 'playwright-core': '1.61.0' },
       },

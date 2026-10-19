@@ -358,14 +358,15 @@ export function buildToolDefs(): ToolDef[] {
         const ms = timeoutOf(a)
         const { value, notes } = await onTab(deps, a.tabId as string, async ({ tab, page }) => {
           const opts = { waitUntil: 'domcontentloaded' as const, timeout: ms }
+          const history = { waitUntil: 'commit' as const, timeout: ms }
           tab.refs = null
           const res =
             target !== undefined
               ? await page.goto(target, opts)
               : a.action === 'back'
-                ? await page.goBack(opts)
+                ? await page.goBack(history)
                 : a.action === 'forward'
-                  ? await page.goForward(opts)
+                  ? await page.goForward(history)
                   : await page.reload(opts)
           return {
             url: page.url(),

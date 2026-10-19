@@ -47,6 +47,7 @@ function inside(child: string, parent: string): boolean {
 export function assertOwnProfileDir(
   opts: {
     profileDir?: unknown
+    ignoreAllDefaultArgs?: unknown
     ignoreDefaultArgs?: unknown
     args?: readonly string[]
   },
@@ -73,6 +74,12 @@ export function assertOwnProfileDir(
     throw new LaunchGuardError(
       'refusing to start Chrome: ignoreDefaultArgs would drop --user-data-dir (Chrome would open the normal profile)',
     )
+  }
+  const userDataArgs = (opts.args ?? []).filter((arg) => /^--user-data-dir/.test(arg))
+  if (opts.ignoreAllDefaultArgs === true) {
+    if (userDataArgs.length !== 1 || userDataArgs[0] !== `--user-data-dir=${dir}`)
+      throw new LaunchGuardError('Plugin unavailable. Try again.')
+    return
   }
   for (const a of opts.args ?? []) {
     if (/^--user-data-dir/.test(a))

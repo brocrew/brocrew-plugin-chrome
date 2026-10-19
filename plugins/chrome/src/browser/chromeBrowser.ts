@@ -10,17 +10,13 @@ import { createKeyedSerializer, createTransitionBarrier } from '../shared/browse
 import type { KeyedSerializer, TransitionBarrier } from '../shared/browser/browser-lease.js'
 import { createChromeUa, createUaReader, fallbackUaFor } from '../shared/browser/chromeUa.js'
 import type { ChromeUa } from '../shared/browser/chromeUa.js'
-import {
-  CONFIG_C,
-  OWN_SIGNALS,
-  browserChoice,
-  launchTarget,
-} from '../shared/browser/launchConfig.js'
+import { OWN_SIGNALS, browserChoice, launchTarget } from '../shared/browser/launchConfig.js'
 import type { BrowserChoice } from '../shared/browser/launchConfig.js'
 import { allPagesClosed } from '../shared/browser/pagesClosed.js'
 import type { Logger } from '../logger.js'
 import { silentLogger } from '../logger.js'
 import { settledWithin } from '../settled.js'
+import { launchArgs } from './launchArgs.js'
 import { DownloadRouter } from './downloadRouter.js'
 import { BROWSER_MISSING, BrowserNotFoundError, ProfileInUseError } from './profileBrowser.js'
 import type { BrowserMode, ProfileBrowser } from './profileBrowser.js'
@@ -32,7 +28,6 @@ import {
   processList,
 } from './processes.js'
 import type { EndDeps, Platform } from './processes.js'
-export const SYNC_DROPPED_ARGS = ['--disable-sync'] as const
 export const IDLE_MS = 10 * 60 * 1000
 export const LOCK_WAIT_MS = 5000
 export const CLOSE_MS = 10000
@@ -264,16 +259,16 @@ export class ChromeBrowser implements ProfileBrowser {
       ...launchTarget(this.choice),
       ...(stagingDir ? { downloadsPath: stagingDir } : {}),
       ...(this.opts.noSandbox === true ? {} : { chromiumSandbox: true }),
-      ignoreDefaultArgs: [
-        ...CONFIG_C.ignoreDefaultArgs,
-        ...(extensions ? ['--disable-extensions'] : []),
-        ...(sync ? SYNC_DROPPED_ARGS : []),
-      ],
-      args: [
-        ...CONFIG_C.args,
-        ...(this.opts.noTestType === true ? [] : ['--test-type']),
-        ...(this.opts.extraArgs ?? []),
-      ],
+      ignoreAllDefaultArgs: true,
+      args: launchArgs({
+        profileDir: dir,
+        mode,
+        sync,
+        extensions,
+        noSandbox: this.opts.noSandbox === true,
+        noTestType: this.opts.noTestType === true,
+        ...(this.opts.extraArgs ? { extraArgs: this.opts.extraArgs } : {}),
+      }),
       ...OWN_SIGNALS,
       ...(mode === 'visible' ? { viewport: null } : {}),
     }

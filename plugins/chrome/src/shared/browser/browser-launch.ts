@@ -5,6 +5,7 @@ export interface ChromiumLaunchOptions {
   headless: boolean
   executablePath?: string
   channel?: 'chrome' | 'chromium' | 'msedge'
+  ignoreAllDefaultArgs?: boolean
   ignoreDefaultArgs?: readonly string[]
   userAgent?: string
   viewport?: {
@@ -31,6 +32,7 @@ export async function launchPersistentChromium(
     ...(opts.ignoreDefaultArgs !== undefined
       ? { ignoreDefaultArgs: [...opts.ignoreDefaultArgs] }
       : {}),
+    ...(opts.ignoreAllDefaultArgs === true ? { ignoreDefaultArgs: true } : {}),
     ...(opts.userAgent !== undefined ? { userAgent: opts.userAgent } : {}),
     ...(opts.viewport !== undefined ? { viewport: opts.viewport } : {}),
     ...(opts.downloadsPath !== undefined ? { downloadsPath: opts.downloadsPath } : {}),
