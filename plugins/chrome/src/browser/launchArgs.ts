@@ -1,3 +1,4 @@
+import type { BrowserChannel } from '../shared/browser/launchConfig.js'
 import type { BrowserMode } from './profileBrowser.js'
 
 export interface LaunchArgsInput {
@@ -12,6 +13,7 @@ export interface LaunchArgsInput {
 
   noTestType: boolean
   platform?: NodeJS.Platform
+  channel?: BrowserChannel
 
   extraArgs?: readonly string[]
 }
@@ -23,8 +25,8 @@ export function launchArgs(i: LaunchArgsInput): string[] {
     '--remote-debugging-pipe',
     '--disable-blink-features=AutomationControlled',
     ...(i.noTestType ? [] : ['--test-type']),
-    '--password-store=basic',
-    '--use-mock-keychain',
+    // Only unbranded Chromium/test builds use the mock store. Branded browsers use OS protection.
+    ...(i.channel === 'chromium' ? ['--password-store=basic', '--use-mock-keychain'] : []),
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-search-engine-choice-screen',

@@ -18,8 +18,6 @@ describe('launchArgs: the whole command line, nothing else', () => {
       '--remote-debugging-pipe',
       '--disable-blink-features=AutomationControlled',
       '--test-type',
-      '--password-store=basic',
-      '--use-mock-keychain',
       '--no-first-run',
       '--no-default-browser-check',
       '--disable-search-engine-choice-screen',
@@ -28,6 +26,17 @@ describe('launchArgs: the whole command line, nothing else', () => {
       'about:blank',
     ])
   })
+  it.each(['visible', 'headless'] as const)(
+    'uses OS credential protection for branded Chrome in %s mode',
+    (mode) => {
+      const args = launchArgs({ ...base, mode, channel: 'chrome' })
+      expect(args).not.toContain('--use-mock-keychain')
+      expect(args).not.toContain('--password-store=basic')
+      const unbranded = launchArgs({ ...base, mode, channel: 'chromium' })
+      expect(unbranded).toContain('--use-mock-keychain')
+      expect(unbranded).toContain('--password-store=basic')
+    },
+  )
   it('headless adds only the headless flags; sync / extensions on remove only their own flag; test-type off removes only itself', () => {
     const head = launchArgs({ ...base, mode: 'headless' })
     expect(head.filter((a) => !launchArgs(base).includes(a))).toEqual([

@@ -16,6 +16,8 @@ import { afterAll, afterEach, beforeAll, expect, it } from 'vitest'
 const root = fileURLToPath(new URL('../../', import.meta.url))
 const standalone =
   JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).name === 'brocrew-plugin-chrome'
+// The release workflow runs these guards under /bin/sh on Linux; Windows has no such shell.
+const windows = process.platform === 'win32'
 const scratch = []
 let releaseRoot, exported
 beforeAll(async () => {
@@ -110,20 +112,23 @@ for (const variable of [
   'BROBOT_COMMIT_PATTERNS',
   'BROBOT_COMMIT_IDENTITIES',
 ]) {
-  it.each([undefined, '', ' \n '])(
+  it.skipIf(windows).each([undefined, '', ' \n '])(
     'refuses publication with unset/empty %s: ' + variable,
     (value) => {
       expect(attempt({ [variable]: value })).toEqual({ status: 1, published: false })
     },
   )
 }
-it('permits publication only with configured patterns and the allowed identity', () => {
-  expect(attempt()).toEqual({ status: 0, published: true })
-})
-it('blocks an unapproved commit identity', () => {
+it.skipIf(windows)(
+  'permits publication only with configured patterns and the allowed identity',
+  () => {
+    expect(attempt()).toEqual({ status: 0, published: true })
+  },
+)
+it.skipIf(windows)('blocks an unapproved commit identity', () => {
   expect(attempt({}, 'Different Writer')).toEqual({ status: 1, published: false })
 })
-it('blocks forbidden commit metadata', () => {
+it.skipIf(windows)('blocks forbidden commit metadata', () => {
   expect(attempt({}, 'Release Writer', 'Fictional private note')).toEqual({
     status: 1,
     published: false,

@@ -123,12 +123,19 @@ export interface EndDeps {
 export const MAIN_TERM_WAIT_MS = 1500
 const isMain = (p: BrowserProcess): boolean => !/ --type=/.test(p.command)
 const sleepFor = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+/**
+ * Ends what still runs on this profile folder. On Windows the plugin host holds every process this
+ * server starts in a job: Playwright's own force-close ends the browser through its handle, its
+ * child processes end with it, and anything left ends with the job; a sweep there by process
+ * number could reach a process that took a number since it was listed.
+ */
 export async function endBrowsersOf(
   dir: string,
   graceMs: number,
   deps: EndDeps = {},
 ): Promise<void> {
   const platform = deps.platform ?? process.platform
+  if (platform === 'win32') return
   const run = deps.run ?? realRun
   const list = deps.list ?? (() => processList(platform, run))
   const kill = deps.kill ?? ((pid: number, signal: Signal) => process.kill(pid, signal))
@@ -145,29 +152,21 @@ export async function endBrowsersOf(
       }
     }
   }
-  if (platform === 'win32') {
-    const first = await mine()
-    const mains = first.filter((p) => !/ --type=/.test(p.command))
-    for (const p of mains.length > 0 ? mains : first) await run('taskkill', ['/PID', String(p.pid)])
-  } else {
-    const mains = (await mine()).filter(isMain).map((p) => p.pid)
-    if (mains.length > 0) {
-      signal(mains, 'SIGTERM')
-      const mainEnd = now() + (deps.mainWaitMs ?? MAIN_TERM_WAIT_MS)
-      while ((await mine()).some(isMain) && now() < mainEnd) await sleep(100)
-    }
-    signal(
-      (await mine()).map((p) => p.pid),
-      'SIGTERM',
-    )
+  const mains = (await mine()).filter(isMain).map((p) => p.pid)
+  if (mains.length > 0) {
+    signal(mains, 'SIGTERM')
+    const mainEnd = now() + (deps.mainWaitMs ?? MAIN_TERM_WAIT_MS)
+    while ((await mine()).some(isMain) && now() < mainEnd) await sleep(100)
   }
+  signal(
+    (await mine()).map((p) => p.pid),
+    'SIGTERM',
+  )
   const end = now() + graceMs
   while ((await mine()).length > 0 && now() < end) await sleep(200)
   const left = (await mine()).map((p) => p.pid)
   if (left.length === 0) return
-  if (platform === 'win32')
-    await run('taskkill', ['/F', ...left.flatMap((pid) => ['/PID', String(pid)])])
-  else signal(left, 'SIGKILL')
+  signal(left, 'SIGKILL')
 }
 export async function lockfileBusy(
   file: string,

@@ -39,3 +39,7 @@ Paths on the left are below `servers/`; destinations are relative to `plugins/ch
 Every download remains under private staging; CDP stays allowAndName in both modes. There is no OS Downloads fallback. The explicit private data/config roots, separate person/tool authentication, authenticated readiness, host-owned executable, IPC receipt, exact-run exit proof and removed person-step records are unchanged. A new invalid all-default launch uses only the already approved “Plugin unavailable. Try again.” wording. No product UI or tool description is changed.
 
 The server runtime version comes from manifest-template.json, the same release metadata used by the builder. The shared MCP factory requires an explicit version, with no literal fallback. Built-archive health and MCP initialization are checked against the emitted manifest; the app-only integration also runs the real Node host through ready and exact-run exit with an inert browser.
+
+## 0.1.2: Windows
+
+Not an upstream change. On Windows, `src/browser/processes.ts` no longer ends a profile's browsers by process number: the BroCrew plugin host holds every process this server starts in a job object, Playwright's own force-close ends the browser through its handle, and the job ends the rest. The release builds one archive per target from the same source; each manifest names exactly its own target.

@@ -8,7 +8,7 @@ export class LaunchGuardError extends Error {
   }
 }
 export function defaultChromeDirs(
-  home = os.homedir(),
+  home = os.userInfo().homedir,
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
@@ -22,16 +22,25 @@ export function defaultChromeDirs(
       ),
     )
   if (platform === 'win32') {
-    const local = env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local')
-    return [
-      path.win32.join(local, 'Google', 'Chrome'),
-      path.win32.join(local, 'Chromium'),
-      path.win32.join(local, 'Microsoft', 'Edge'),
-    ]
+    const roots = new Set([path.win32.join(home, 'AppData', 'Local'), env.LOCALAPPDATA])
+    return [...roots]
+      .filter((root): root is string => !!root)
+      .flatMap((local) => [
+        path.win32.join(local, 'Google', 'Chrome'),
+        path.win32.join(local, 'Chromium'),
+        path.win32.join(local, 'Microsoft', 'Edge'),
+      ])
   }
-  return ['google-chrome', 'google-chrome-beta', 'chromium', 'microsoft-edge'].map((n) =>
-    path.join(env.XDG_CONFIG_HOME ?? path.join(home, '.config'), n),
-  )
+  // The host intentionally rewrites HOME/XDG_CONFIG_HOME for the plugin. Those
+  // values may add a configured root, but must never hide the person's real root.
+  const roots = new Set([path.join(home, '.config'), env.XDG_CONFIG_HOME])
+  return [...roots]
+    .filter((root): root is string => !!root)
+    .flatMap((root) =>
+      ['google-chrome', 'google-chrome-beta', 'chromium', 'microsoft-edge'].map((n) =>
+        path.join(root, n),
+      ),
+    )
 }
 const isAbsolute = (p: string): boolean => path.isAbsolute(p) || path.win32.isAbsolute(p)
 function inside(child: string, parent: string): boolean {

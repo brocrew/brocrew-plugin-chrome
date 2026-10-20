@@ -17,7 +17,7 @@ import type { Logger } from '../logger.js'
 import { silentLogger } from '../logger.js'
 import { settledWithin } from '../settled.js'
 import { launchArgs } from './launchArgs.js'
-import { DownloadRouter } from './downloadRouter.js'
+import { DownloadRouter, UnclaimedDownloadQuota } from './downloadRouter.js'
 import { BROWSER_MISSING, BrowserNotFoundError, ProfileInUseError } from './profileBrowser.js'
 import type { BrowserMode, ProfileBrowser } from './profileBrowser.js'
 import {
@@ -151,6 +151,7 @@ export class ChromeBrowser implements ProfileBrowser {
   private readonly exitGraceMs: number
   private readonly pollMs: number
   private readonly killChrome: (dir: string) => Promise<void>
+  private readonly downloadQuotas = new Map<string, UnclaimedDownloadQuota>()
   private generations = 0
   private shuttingDown = false
   private readonly choice: BrowserChoice
@@ -262,6 +263,7 @@ export class ChromeBrowser implements ProfileBrowser {
       ignoreAllDefaultArgs: true,
       args: launchArgs({
         profileDir: dir,
+        channel: this.choice.channel,
         mode,
         sync,
         extensions,
@@ -314,7 +316,14 @@ export class ChromeBrowser implements ProfileBrowser {
       if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true })
       throw new Error('the server is shutting down')
     }
-    const nativeDownloads = stagingDir ? await this.nativeDownloads(ctx, stagingDir, dir) : null
+    let nativeDownloads: Entry['downloads']
+    try {
+      nativeDownloads = await this.nativeDownloads(ctx, stagingDir, dir, mode, () => e.ctx === ctx)
+    } catch (error) {
+      await this.endDownloadBrowser(ctx, dir)
+      fs.rmSync(stagingDir, { recursive: true, force: true })
+      throw error
+    }
     const generation = ++this.generations
     e.ctx = ctx
     e.mode = mode
@@ -371,65 +380,97 @@ export class ChromeBrowser implements ProfileBrowser {
   private privateDownloadStage(profileDir: string): string {
     return fs.mkdtempSync(path.join(this.downloadRoot(profileDir), 'stage-'))
   }
+  private async endDownloadBrowser(
+    ctx: BrowserContext,
+    profileDir: string,
+    isCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    let closed = false
+    await settledWithin(
+      ctx.close().then(() => {
+        closed = true
+      }),
+      this.closeMs,
+    )
+    if (!closed) {
+      if (!isCurrent()) throw new Error('Plugin unavailable. Try again.')
+      await this.killChrome(profileDir)
+    }
+  }
   private async nativeDownloads(
     ctx: BrowserContext,
     dir: string,
     profileDir: string,
-  ): Promise<Entry['downloads']> {
-    try {
-      const session = await ctx.browser()!.newBrowserCDPSession()
-      const router = new DownloadRouter({
-        dir,
-        session,
-        nativeDir: () => this.downloadRoot(profileDir),
-        fallbackDirs: () => [this.downloadRoot(profileDir)],
-        logger: this.logger,
-      })
-      await session.send('Browser.setDownloadBehavior', {
-        behavior: 'allowAndName',
-        downloadPath: dir,
-        eventsEnabled: true,
-      })
-      return { dir, session, captures: 0, chain: Promise.resolve(), router }
-    } catch {
-      this.logger.warn("visible downloads: Chrome keeps Playwright's handling")
-      return null
+    mode: BrowserMode,
+    isCurrent: () => boolean,
+  ): Promise<NonNullable<Entry['downloads']>> {
+    const session = await ctx.browser()!.newBrowserCDPSession()
+    let ending: Promise<void> | undefined
+    const end = (): Promise<void> =>
+      (ending ??= this.endDownloadBrowser(ctx, profileDir, isCurrent))
+    let quota = this.downloadQuotas.get(profileDir)
+    if (!quota) {
+      quota = new UnclaimedDownloadQuota()
+      this.downloadQuotas.set(profileDir, quota)
     }
+    const router = new DownloadRouter({
+      dir,
+      session,
+      nativeDir: () => this.downloadRoot(profileDir),
+      fallbackDirs: () => [this.downloadRoot(profileDir)],
+      logger: this.logger,
+      allowUnclaimed: mode === 'visible',
+      quota,
+      onPolicyFailure: end,
+    })
+    await session.send('Browser.setDownloadBehavior', {
+      behavior: mode === 'headless' ? 'deny' : 'allowAndName',
+      downloadPath: dir,
+      eventsEnabled: true,
+    })
+    return { dir, session, captures: 0, chain: Promise.resolve(), router }
   }
   async captureDownloads<T>(profile: string, page: Page, fn: () => Promise<T>): Promise<T> {
     const e = this.entries.get(profile)
     const d = e?.downloads
-    if (!e || !d) return fn()
+    const ctx = e?.ctx
+    if (!e || !d || !ctx) throw new Error('Plugin unavailable. Try again.')
+    const mode = e.mode
     const apply = (): Promise<void> => {
       d.chain = d.chain
         .then(async () => {
+          if (e.ctx !== ctx || e.downloads !== d) throw new Error('Plugin unavailable. Try again.')
           await d.session.send('Browser.setDownloadBehavior', {
-            behavior: 'allowAndName',
+            behavior: mode === 'headless' && d.captures === 0 ? 'deny' : 'allowAndName',
             downloadPath: d.dir,
             eventsEnabled: true,
           })
         })
-        .catch(() => this.logger.warn('visible downloads: the capture could not be switched'))
+        .catch(async (error: unknown) => {
+          await this.endDownloadBrowser(ctx, this.dir(profile), () => e.ctx === ctx)
+          throw error
+        })
       return d.chain
     }
     d.captures++
-    await apply()
     const held: {
       session?: Promise<CDPSession>
     } = {}
-    const ctx = e.ctx
     const capture = d.router.capture(async () => {
-      if (!ctx) throw new Error('no browser')
       held.session ??= ctx.newCDPSession(page)
       const tree = (await (await held.session).send('Page.getFrameTree')) as {
         frameTree: FrameTree
       }
       return frameIdsOf(tree.frameTree)
     })
+    let completed = false
     try {
-      return await fn()
+      await apply()
+      const result = await fn()
+      completed = true
+      return result
     } finally {
-      capture.end()
+      capture.end(completed)
       void held.session?.then((s) => s.detach()).catch(() => undefined)
       d.captures--
       await apply()

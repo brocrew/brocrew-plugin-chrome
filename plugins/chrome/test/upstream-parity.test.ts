@@ -25,6 +25,60 @@ afterEach(async () => {
   for (const home of homes.splice(0)) fs.rmSync(home, { recursive: true, force: true })
   vi.clearAllMocks()
 })
+it('names absolute files and download folders under the private plugin HOME', () => {
+  const h = setup()
+  const pluginHome = path.join(h.home, 'fictional-plugin-home')
+  const filesRoot = path.join(pluginHome, 'files')
+  const downloadsRoot = path.join(pluginHome, 'downloads')
+  const home = vi.spyOn(os, 'homedir').mockReturnValue(pluginHome)
+  try {
+    const tools = createAgentChromeTools({
+      ...h.deps,
+      guard: () => ({ ...h.deps.guard(), roots: [filesRoot] }),
+      downloadsRoot,
+    })
+    const upload = tools.find((t) => t.definition.name === 'upload_file')!.definition.description
+    const download = tools.find((t) => t.definition.name === 'download')!.definition.description
+    expect(upload).toContain(filesRoot)
+    expect(upload).not.toContain('~/files')
+    expect(download).toContain(downloadsRoot)
+    expect(download).not.toContain('~/downloads')
+  } finally {
+    home.mockRestore()
+  }
+})
+it('gives only the Chrome child the OS account HOME while retaining its owned profile', async () => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-keychain-home-')))
+  homes.push(root)
+  const profileDir = path.join(root, 'fern')
+  const serverHome = process.env.HOME
+  const account = vi.spyOn(os, 'userInfo').mockReturnValue({
+    uid: 1000,
+    gid: 1000,
+    username: 'fictional',
+    shell: '/bin/fictional',
+    homedir: '/fictional/account',
+  })
+  try {
+    await launchPersistentChromium({
+      profileDir,
+      channel: 'chrome',
+      headless: true,
+      ignoreAllDefaultArgs: true,
+      args: [`--user-data-dir=${profileDir}`, '--remote-debugging-pipe'],
+    })
+    expect(fake.launch).toHaveBeenCalledWith(
+      profileDir,
+      expect.objectContaining({
+        env: { ...process.env, HOME: '/fictional/account' },
+        args: [`--user-data-dir=${profileDir}`, '--remote-debugging-pipe'],
+      }),
+    )
+    expect(process.env.HOME).toBe(serverHome)
+  } finally {
+    account.mockRestore()
+  }
+})
 it('passes only explicitly owned all-default arguments to the fake Playwright driver', async () => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-all-args-')))
   homes.push(root)

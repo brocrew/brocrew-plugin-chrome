@@ -15,22 +15,22 @@
       "source": "agent-chrome/src/browser/chromeBrowser.ts",
       "destination": "plugins/chrome/src/browser/chromeBrowser.ts",
       "sourceSha256": "b504f5128ab5f51b3d5dd875a197b137d0da27bfadbb1a59ff79d11b530449bf",
-      "changes": "Private staging in every mode; CDP always allowAndName under private downloads; no OS Downloads fallback; local imports and comments/client material removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: minimal explicit owned arguments, drop all Playwright defaults, preserve private download staging/CDP in both modes",
-      "destinationSha256": "013f0555a09eee7b8e8a4c1ad29497e02f107553ba1731f79c61fcb63a1e1f11"
+      "changes": "Private staging in every mode; CDP always allowAndName under private downloads; no OS Downloads fallback; local imports and comments/client material removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: minimal explicit owned arguments, drop all Playwright defaults, preserve private download staging/CDP in both modes; 0.1.2: the OS credential store for branded Chrome profiles; downloads bounded and unattended headless downloads denied",
+      "destinationSha256": "5a6cad4b594373152270aa3f7fda706cb8375b8be7f1fff5e6e9f2642cc0770a"
     },
     {
       "source": "agent-chrome/src/browser/downloadRouter.ts",
       "destination": "plugins/chrome/src/browser/downloadRouter.ts",
       "sourceSha256": "12020639ab8cffae01fdf118081d0a39700617da4988c83061cf04d1a1073350",
-      "changes": "Local imports; removed personal Downloads preference resolver; placement/collision behavior retained inside private root; comments/client material removed; queued permission rechecks or private-directory lstat/realpath fences",
-      "destinationSha256": "a4b1272efc4af8b4d76e7cfc048bad7b45b633d9196899028632b805e439eef1"
+      "changes": "Local imports; removed personal Downloads preference resolver; placement/collision behavior retained inside private root; comments/client material removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.2: downloads bounded per download and per profile per hour; fail closed when the download policy cannot be set; 0.1.2: a released claim stays counted until its own download ends",
+      "destinationSha256": "2cebd8ed730175530c1b0bac59befe18d34ef94f0c02ac4b1c27f66d85f7cc4b"
     },
     {
       "source": "agent-chrome/src/browser/processes.ts",
       "destination": "plugins/chrome/src/browser/processes.ts",
       "sourceSha256": "42216ec4d9253ca718eb7d2f9b8e3390b4494b6a562704e1c46c584b22e1d293",
-      "changes": "relative shared imports; comments and client references removed; private configuration adjustments listed in README",
-      "destinationSha256": "28e22b7d52b0f7298a6c00bf7497ccb17648ddc2ccbc70150e8e03eacd8a37d9"
+      "changes": "relative shared imports; comments and client references removed; private configuration adjustments listed in README; 0.1.2: on Windows no sweep by process number; the host's job holds every browser process",
+      "destinationSha256": "66503e0b5c4bb04ed399019efbed8fe89f0c32c14e3c3095e179f02f11786f50"
     },
     {
       "source": "agent-chrome/src/browser/profileBrowser.ts",
@@ -162,8 +162,8 @@
       "source": "agent-chrome/src/tools/index.ts",
       "destination": "plugins/chrome/src/tools/index.ts",
       "sourceSha256": "23f8ed4bafd42f3578e915f835a195c99bd8092d7215b4dd812b0fe406768569",
-      "changes": "private downloads; reviewed errors; source dashboard instructions replaced by Plugins screen; comments/client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: back/forward wait for commit; URL/reload retain DOM load wait",
-      "destinationSha256": "611ce968f19a78ada249b8965a7db3dda7fc2e2ff70f904b4ff2c90e25202529"
+      "changes": "private downloads; reviewed errors; source dashboard instructions replaced by Plugins screen; comments/client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: back/forward wait for commit; URL/reload retain DOM load wait; 0.1.2: a download is watched for before the click or navigation that starts it; a headless wait ignores earlier denied downloads; 0.1.2: tool descriptions name the private files and downloads folders by their absolute paths",
+      "destinationSha256": "8e834d000de963db7471f919cb1188479cfec3fc2114034c34af0dbbedfad08e"
     },
     {
       "source": "agent-chrome/src/tools/modeSwitch.ts",
@@ -239,8 +239,8 @@
       "source": "shared/src/browser/browser-launch.ts",
       "destination": "plugins/chrome/src/shared/browser/browser-launch.ts",
       "sourceSha256": "b837637e5731efa50470128ce57fd139253da7b666a959a1bd54c06ab701820d",
-      "changes": "local imports preserved; comments and client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: explicit ignoreAllDefaultArgs option, both pre/post-import private fences preserved",
-      "destinationSha256": "e91c9aa1a4e7216b55bacbe199230ebf0c16bd8bbc0deccd9891e575f1e3bcce"
+      "changes": "local imports preserved; comments and client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: explicit ignoreAllDefaultArgs option, both pre/post-import private fences preserved; 0.1.2: Chrome alone gets the account's real home for the OS credential store; the server's home is unchanged",
+      "destinationSha256": "b5364316cefcd79f45b671652bccca942a110bf3457ea570d4e700b1d1b941be"
     },
     {
       "source": "shared/src/browser/browser-lease.ts",
@@ -281,8 +281,8 @@
       "source": "shared/src/browser/launchGuard.ts",
       "destination": "plugins/chrome/src/shared/browser/launchGuard.ts",
       "sourceSha256": "d8c0bb8b6efae7abbaf835d2f73fef2afb257500dc3fb8821ac9308641f0dca4",
-      "changes": "explicit addition beyond planned helper purposes: preserve assertOwnProfileDir fence as separate module; no alert helper exists in current import closure; comments/client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: all defaults may be dropped only with exactly one user-data-dir equal to the validated private profile; generic approved refusal",
-      "destinationSha256": "86fdf5425063e12e015c147230e07e3bc12bfafcb93bdd2ad31c7983d70b39b4"
+      "changes": "explicit addition beyond planned helper purposes: preserve assertOwnProfileDir fence as separate module; no alert helper exists in current import closure; comments/client references removed; queued permission rechecks or private-directory lstat/realpath fences; 0.1.1: all defaults may be dropped only with exactly one user-data-dir equal to the validated private profile; generic approved refusal; 0.1.2: the real account's own Chrome directory stays refused beside the supplied LOCALAPPDATA",
+      "destinationSha256": "c55672ddca332b683ab5a1b1da21dbd497de3b70fe292541dd5570afbccfbcab"
     },
     {
       "source": "agent-chrome/src/testSupport.ts",
@@ -295,8 +295,8 @@
       "source": "agent-chrome/src/browser/launchArgs.ts",
       "destination": "plugins/chrome/src/browser/launchArgs.ts",
       "sourceSha256": "00d16dfd40601eaee51656e7b2e03079e4a58ef8b88c1c288565093782a7a319",
-      "destinationSha256": "b234f2b068173f34755a77bbb0fe38d59095a1c9903db123d623bd6389c4e042",
-      "changes": "0.1.1: minimal launch-argument builder; comments and source-specific environment descriptions removed; local imports; no runtime dependency on source repo"
+      "destinationSha256": "a91c872c567214c9101d279f88207ff4327788986e18a9d9271172dcb42b570b",
+      "changes": "0.1.1: minimal launch-argument builder; comments and source-specific environment descriptions removed; local imports; no runtime dependency on source repo; 0.1.2: the OS credential store for branded Chrome profiles"
     }
   ],
   "metadata": {

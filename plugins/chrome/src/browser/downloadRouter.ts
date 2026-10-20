@@ -3,23 +3,41 @@ import { privateFolder } from '../privatePaths.js'
 import path from 'node:path'
 import type { Logger } from '../logger.js'
 import { silentLogger } from '../logger.js'
-import { WINDOWS_DEVICE } from '../files.js'
+import { MAX_DOWNLOAD_BYTES, WINDOWS_DEVICE } from '../files.js'
 export interface DownloadSession {
+  send(method: 'Browser.cancelDownload', params: { guid: string }): Promise<unknown>
   on(event: string, cb: (params: Record<string, unknown>) => void): unknown
 }
 export type FrameIds = () => Promise<ReadonlySet<string>>
 export interface Capture {
-  end(): void
+  end(completed?: boolean): void
 }
 interface Rec {
   name: string
   frameId: string
   owner: CaptureImpl | null
-  state: 'running' | 'completed'
+  state: 'running' | 'completed' | 'canceled'
+  unclaimed: boolean
+  releasedAfterSuccess: boolean
   placing: boolean
   dest: string | null
   swept: boolean
   decided: Promise<void>
+}
+// Shared across browser generations, separately for each profile. Claimed tool downloads
+// retain their existing limit; only unattended page downloads consume this allowance.
+export const MAX_UNCLAIMED_PER_HOUR = 20
+const HOUR_MS = 60 * 60 * 1000
+export class UnclaimedDownloadQuota {
+  private admitted: number[] = []
+  constructor(private readonly now: () => number = Date.now) {}
+  take(): boolean {
+    const now = this.now()
+    this.admitted = this.admitted.filter((at) => at > now - HOUR_MS)
+    if (this.admitted.length >= MAX_UNCLAIMED_PER_HOUR) return false
+    this.admitted.push(now)
+    return true
+  }
 }
 const MAX_RECORDS = 500
 const MAX_NAME_BYTES = 200
@@ -30,10 +48,10 @@ class CaptureImpl implements Capture {
     readonly frames: FrameIds,
     private readonly router: DownloadRouter,
   ) {}
-  end(): void {
+  end(completed = false): void {
     if (this.ended) return
     this.ended = true
-    this.router.release(this)
+    this.router.release(this, completed)
   }
 }
 export interface RouterOptions {
@@ -42,6 +60,9 @@ export interface RouterOptions {
   nativeDir: () => string
   fallbackDirs?: () => string[]
   logger?: Logger
+  allowUnclaimed: boolean
+  quota: UnclaimedDownloadQuota
+  onPolicyFailure: () => Promise<void>
 }
 export class DownloadRouter {
   private readonly recs = new Map<string, Rec>()
@@ -59,13 +80,19 @@ export class DownloadRouter {
     return c
   }
   private begin(p: { guid?: unknown; frameId?: unknown; suggestedFilename?: unknown }): void {
-    if (typeof p.guid !== 'string') return
-    if (this.recs.size >= MAX_RECORDS) this.recs.delete(this.recs.keys().next().value as string)
+    if (typeof p.guid !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(p.guid)) return
+    if (this.recs.has(p.guid)) return
+    if (this.recs.size >= MAX_RECORDS) {
+      this.cancel(p.guid)
+      return
+    }
     const rec: Rec = {
       name: typeof p.suggestedFilename === 'string' ? p.suggestedFilename : '',
       frameId: typeof p.frameId === 'string' ? p.frameId : '',
       owner: null,
       state: 'running',
+      unclaimed: false,
+      releasedAfterSuccess: false,
       placing: false,
       dest: null,
       swept: false,
@@ -73,11 +100,11 @@ export class DownloadRouter {
     }
     this.recs.set(p.guid, rec)
     rec.decided = this.decisions = this.decisions
-      .then(() => this.decide(rec))
+      .then(() => this.decide(p.guid as string, rec))
       .catch(() => undefined)
   }
-  private async decide(rec: Rec): Promise<void> {
-    if (rec.frameId === '') return
+  private async decide(guid: string, rec: Rec): Promise<void> {
+    if (rec.state === 'canceled') return
     for (const c of this.captures) {
       if (c.taken || c.ended) continue
       let ids: ReadonlySet<string>
@@ -86,39 +113,103 @@ export class DownloadRouter {
       } catch {
         continue
       }
+      if (this.recs.get(guid) !== rec) return
       if (c.ended || !ids.has(rec.frameId)) continue
       c.taken = true
       rec.owner = c
       return
     }
+    this.admitUnclaimed(guid, rec)
   }
-  private progress(p: { guid?: unknown; state?: unknown }): void {
+  private admitUnclaimed(guid: string, rec: Rec): void {
+    if (rec.unclaimed || rec.state === 'canceled') return
+    if (!this.o.allowUnclaimed || !this.o.quota.take()) {
+      this.cancel(guid, rec)
+      return
+    }
+    rec.unclaimed = true
+  }
+  private cancel(guid: string, rec = this.recs.get(guid)): void {
+    if (rec) rec.state = 'canceled'
+    this.recs.delete(guid)
+    // Cancellation failure ends only this owned browser: never keep downloading
+    // after losing enforcement, and never fall back to Playwright's defaults.
+    void this.o.session
+      .send('Browser.cancelDownload', { guid })
+      .then(() => fs.promises.rm(path.join(this.o.dir, guid), { force: true }))
+      .catch(() => this.o.onPolicyFailure())
+      .catch(() => this.logger.warn('download policy could not close the owned browser'))
+  }
+  private progress(p: {
+    guid?: unknown
+    state?: unknown
+    receivedBytes?: unknown
+    totalBytes?: unknown
+  }): void {
     if (typeof p.guid !== 'string') return
     const rec = this.recs.get(p.guid)
     if (!rec) return
     const guid = p.guid
+    if (
+      [p.receivedBytes, p.totalBytes].some(
+        (n) => typeof n === 'number' && (!Number.isFinite(n) || n < 0 || n > MAX_DOWNLOAD_BYTES),
+      )
+    ) {
+      this.cancel(guid, rec)
+      return
+    }
     if (p.state === 'canceled') {
+      rec.state = 'canceled'
       this.recs.delete(guid)
       return
     }
     if (p.state !== 'completed') return
     rec.state = 'completed'
+    if (rec.releasedAfterSuccess) {
+      this.discardCompleted(guid, rec)
+      return
+    }
     void rec.decided.then(() => {
-      if (!rec.owner) this.place(guid, rec)
+      if (rec.state !== 'canceled' && !rec.owner) this.place(guid, rec)
     })
   }
-  release(c: CaptureImpl): void {
+  release(c: CaptureImpl, completed = false): void {
     this.captures.delete(c)
     for (const [guid, rec] of this.recs) {
       if (rec.owner !== c) continue
       rec.owner = null
+      // Success may refer to a previously queued download, not this claim.
+      // Keep monitoring a running claim until Chrome proves its completion;
+      // only then can it be forgotten. Late events can still trip the size cap.
+      if (completed) {
+        rec.releasedAfterSuccess = true
+        if (rec.state === 'completed') this.discardCompleted(guid, rec)
+        continue
+      }
+      if (!this.o.allowUnclaimed && rec.state === 'completed') {
+        this.discardCompleted(guid, rec)
+        continue
+      }
+      // A failed tool may leave a user download in a visible window. An
+      // unfinished headless download must stop as soon as the call ends.
+      this.admitUnclaimed(guid, rec)
       if (rec.state === 'completed') this.place(guid, rec)
     }
+  }
+  private discardCompleted(guid: string, rec: Rec): void {
+    rec.state = 'canceled'
+    this.recs.delete(guid)
+    // The successful tool has already saved its result. A different captured
+    // file is discarded, rather than becoming an unclaimed quota bypass.
+    void fs.promises
+      .rm(path.join(this.o.dir, guid), { force: true })
+      .catch(() => this.o.onPolicyFailure())
+      .catch(() => this.logger.warn('download policy could not close the owned browser'))
   }
   sweep(): ReadonlySet<string> {
     const kept = new Set<string>()
     for (const [guid, rec] of this.recs) {
-      if (rec.state !== 'completed') continue
+      if (rec.state !== 'completed' || rec.owner || !rec.unclaimed) continue
       const src = path.join(this.o.dir, guid)
       if (rec.dest) {
         fs.rmSync(src, { force: true })
@@ -134,9 +225,13 @@ export class DownloadRouter {
     return [this.o.nativeDir(), ...(this.o.fallbackDirs?.() ?? [])]
   }
   private place(guid: string, rec: Rec): void {
-    if (rec.placing || rec.dest) return
+    if (rec.state === 'canceled' || !rec.unclaimed || rec.placing || rec.dest) return
     rec.placing = true
     const src = path.join(this.o.dir, guid)
+    if (fs.existsSync(src) && fs.statSync(src).size > MAX_DOWNLOAD_BYTES) {
+      this.cancel(guid, rec)
+      return
+    }
     void (async () => {
       for (const dir of this.dirs()) {
         try {
@@ -170,6 +265,10 @@ export class DownloadRouter {
   }
   private placeSync(src: string, name: string): boolean {
     if (!fs.existsSync(src)) return true
+    if (fs.statSync(src).size > MAX_DOWNLOAD_BYTES) {
+      fs.rmSync(src, { force: true })
+      return true
+    }
     for (const dir of this.dirs()) {
       try {
         placeFileSync(src, dir, name)

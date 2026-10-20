@@ -72,12 +72,20 @@ function copyRuntime(source, target) {
     } else fs.writeFileSync(out, item.bytes)
   }
 }
+/** The targets an archive is built for; its manifest names exactly one. */
+export const CHROME_TARGETS = Object.freeze([
+  Object.freeze({ os: 'darwin', cpu: 'arm64' }),
+  Object.freeze({ os: 'win32', cpu: 'x64' }),
+])
 export async function buildChromePackage(
   destination,
   sourceCommit = process.env.BROCREW_PLUGIN_SOURCE_COMMIT,
+  target = CHROME_TARGETS[0],
 ) {
   if (!/^[a-f0-9]{40}$|^[a-f0-9]{64}$/.test(sourceCommit ?? ''))
     throw new Error('Supply the frozen source commit')
+  if (!CHROME_TARGETS.some((one) => one.os === target?.os && one.cpu === target?.cpu))
+    throw new Error('Supply a supported target')
   if (!path.isAbsolute(destination) || fs.existsSync(destination))
     throw new Error('Use a fresh absolute output folder')
   fs.mkdirSync(destination, { recursive: true, mode: 0o700 })
@@ -114,7 +122,7 @@ export async function buildChromePackage(
     while (current.startsWith(root)) {
       if (fs.existsSync(path.join(current, 'package.json'))) {
         const meta = JSON.parse(fs.readFileSync(path.join(current, 'package.json')))
-        if (meta.name && meta.version && current.includes('/node_modules/')) {
+        if (meta.name && meta.version && current.split(path.sep).includes('node_modules')) {
           packages.set(current, meta)
           break
         }
@@ -162,6 +170,7 @@ export async function buildChromePackage(
   const files = filesBelow(payload)
   const manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest-template.json')))
   manifest.sourceCommit = sourceCommit
+  manifest.platforms = [{ os: target.os, cpu: target.cpu }]
   manifest.files = files.map((file) => ({
     path: file.path,
     type: 'file',
@@ -209,5 +218,7 @@ export async function buildChromePackage(
   )
   return release
 }
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url))
-  await buildChromePackage(process.argv[2])
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const [os, cpu] = (process.argv[3] ?? 'darwin-arm64').split('-')
+  await buildChromePackage(process.argv[2], undefined, { os, cpu })
+}

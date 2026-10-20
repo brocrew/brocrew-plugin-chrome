@@ -79,22 +79,27 @@ describe('private Chrome package', () => {
   it('the built archive reports exactly its manifest version in authenticated health and MCP initialization', async () => {
     const artifact = process.env.BROCREW_CHROME_TEST_ARTIFACT
     expect(artifact, 'Build a fresh artifact and set BROCREW_CHROME_TEST_ARTIFACT').toBeTruthy()
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(artifact!, 'package/plugin.json'), 'utf8'),
-    )
-    const built = await import(pathToFileURL(path.join(artifact!, 'package/server.mjs')).href)
-    const { url, request } = await boot(built.startAgentChrome)
-    const health = await request('/healthz', adminToken)
-    expect(health.status).toBe(200)
-    expect.soft(health.body).toMatchObject({ ok: true, version: manifest.version })
-    const client = new Client({ name: 'fictional-release-version', version: '1' })
-    cleanup.push(() => client.close())
-    await client.connect(
-      new StreamableHTTPClientTransport(new URL(url + '/mcp'), {
-        requestInit: { headers: { Authorization: `Bearer ${mcpToken}` } },
-      }),
-    )
-    expect(client.getServerVersion()?.version).toBe(manifest.version)
+    // One build writes its package at the artifact's root; the release writes one per target.
+    const builds = ['.', 'chrome-darwin-arm64', 'chrome-win32-x64']
+      .map((name) => path.join(artifact!, name, 'package'))
+      .filter((folder) => fs.existsSync(path.join(folder, 'plugin.json')))
+    expect(builds.length).toBeGreaterThan(0)
+    for (const folder of builds) {
+      const manifest = JSON.parse(fs.readFileSync(path.join(folder, 'plugin.json'), 'utf8'))
+      const built = await import(pathToFileURL(path.join(folder, 'server.mjs')).href)
+      const { url, request } = await boot(built.startAgentChrome)
+      const health = await request('/healthz', adminToken)
+      expect(health.status).toBe(200)
+      expect.soft(health.body).toMatchObject({ ok: true, version: manifest.version })
+      const client = new Client({ name: 'fictional-release-version', version: '1' })
+      cleanup.push(() => client.close())
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(url + '/mcp'), {
+          requestInit: { headers: { Authorization: `Bearer ${mcpToken}` } },
+        }),
+      )
+      expect(client.getServerVersion()?.version).toBe(manifest.version)
+    }
   })
   it('requires explicit private paths and distinct private auth, with no workspace fallback', () => {
     expect(() => loadConfig({})).toThrow('Plugin unavailable')

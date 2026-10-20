@@ -239,7 +239,11 @@ it('refuses a linked day folder for a browser-stream download too', async () => 
   const source = path.join(stage, 'payload')
   fs.writeFileSync(source, 'fictional bytes')
   fs.symlinkSync(target, path.join(h.downloads, dayFolder(h.deps.now!())), 'junction')
-  const opened = await h.call('open_tab', { profile: 'fern', url: 'https://fictional.invalid/' })
+  const opened = await h.call('open_tab', {
+    profile: 'fern',
+    url: 'https://fictional.invalid/',
+    visible: true,
+  })
   const id = (opened.json as { tabId: string }).tabId
   const tab = h.tabs.resolve(id, (name) => h.browser.state(name)?.generation ?? null)
   const download = new FakeDownload('paper.txt', Buffer.from('fictional bytes'), source)

@@ -46,4 +46,4 @@ jobs:
           test "$(gh api repos/brocrew/brocrew-plugin-chrome --jq .private)" = true
           test "$TAG" = "v$(node -p "require('./plugins/chrome/manifest-template.json').version")"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes 'Chrome plugin for BroCrew'
-          gh release upload "$TAG" artifact/chrome-darwin-arm64.tar.gz artifact/plugin-list-entry.json
+          gh release upload "$TAG" artifact/chrome-darwin-arm64.tar.gz artifact/chrome-win32-x64.tar.gz artifact/plugin-list-entry.json

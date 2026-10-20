@@ -53,7 +53,6 @@ import {
 import type { ToolDef, ToolDeps } from './common.js'
 import { buildProfileToolDefs } from './profileTools.js'
 import { buildShowHideDefs } from './showHide.js'
-import { shownPath } from './shownPath.js'
 import { MAX_REOPEN, TITLE_RESERVE_MS, nowMs, reopenTabs } from './modeSwitch.js'
 import { PENDING_DOWNLOAD_MS } from '../tabs.js'
 import type { TabState } from '../tabs.js'
@@ -834,19 +833,35 @@ export function buildToolDefs(): ToolDef[] {
       spec: {
         name: 'download',
         description:
-          'Click an element (ref) that starts a download and wait for it. Saved under {downloads}/<date>/; returns the saved path. Works headless and in a visible window (where the other downloads stay in the private plugin downloads folder, not by this tool: only the first download this tab starts during the call is taken, downloads in other tabs are never touched). Max 200 MB.',
-        props: { tabId, ref, timeoutMs },
-        required: ['tabId', 'ref'],
+          'Start and save a download in one call: give exactly one of ref (click the element) or url (navigate this tab). Capture is armed before the action, so this works headless too; do not click or navigate first and wait afterwards in headless mode. Saved under {downloads}/<date>/; returns the saved path. Only the first download this tab starts during the call is taken; downloads in other tabs are never taken. Max 200 MB.',
+        props: { tabId, ref, url, timeoutMs },
+        required: ['tabId'],
       },
       async run(a, deps) {
+        if ((a.ref === undefined) === (a.url === undefined))
+          throw new ToolError('give exactly one of ref or url')
+        const target = a.url === undefined ? undefined : checkUrl(a.url as string)
         const ms = timeoutOf(a)
         const { value, notes } = await onTab(deps, a.tabId as string, async ({ tab, page }) => {
-          const loc = locate(tab, page, a.ref as string)
+          const loc = target === undefined ? locate(tab, page, a.ref as string) : null
+          if (target !== undefined) tab.refs = null
           return deps.browser.captureDownloads(tab.profile, page, async () => {
             const startedAt = Date.now()
             const [download] = await Promise.all([
               page.waitForEvent('download', { timeout: ms }),
-              loc.click({ timeout: ms }),
+              target === undefined
+                ? loc!.click({ timeout: ms })
+                : page
+                    .goto(target, { waitUntil: 'commit', timeout: ms })
+                    .catch((error: unknown) => {
+                      // Chrome ends a navigation when it becomes a download. This
+                      // alone is not success: the matching download must still arrive.
+                      if (
+                        !(error instanceof Error) ||
+                        !/net::ERR_ABORTED|Download is starting/i.test(error.message)
+                      )
+                        throw error
+                    }),
             ])
             dropPending(tab, download)
             return saveDownload(deps, download, ms, startedAt)
@@ -859,7 +874,7 @@ export function buildToolDefs(): ToolDef[] {
       spec: {
         name: 'wait_for_download',
         description:
-          'Save the next download this tab starts WITHOUT a click on a ref (a script or a navigation started it). Call it right after the action that starts the download, or just before it from a parallel call: a download the tab started in the last 60 s and nobody took yet counts. Saved like download; returns the path. In a visible window a download that began BEFORE this call was already saved by Chrome in the private plugin downloads folder: the result then has savedBy:"chrome" and that file\'s path (call this tool first, or in parallel, to get a copy under the agent downloads folder). In a visible window only this tab\'s first download during the wait is taken (downloads in other tabs go to the private plugin downloads folder as usual); one the user starts in this same tab during the wait may be the one taken. Max 200 MB.',
+          'Save the next download this tab starts WITHOUT a click on a ref (a script or a navigation started it). In headless mode, start this wait before the action (or in parallel): downloads outside an active call are denied, and a denied download cannot be recovered afterwards. For a click or navigation, use download with ref or url to arm capture and trigger the action in one call. In a visible window, an unclaimed download from the last 60 s also counts. Saved like download; returns the path. In a visible window a download that began BEFORE this call was already saved by Chrome in the private plugin downloads folder: the result then has savedBy:"chrome" and that file\'s path (call this tool first, or in parallel, to get a copy under the agent downloads folder). In a visible window only this tab\'s first download during the wait is taken (downloads in other tabs go to the private plugin downloads folder as usual); one the user starts in this same tab during the wait may be the one taken. Max 200 MB.',
         props: { tabId, timeoutMs },
         required: ['tabId'],
       },
@@ -870,7 +885,11 @@ export function buildToolDefs(): ToolDef[] {
         deps.browser.touch(tab.profile)
         const now = Date.now()
         tab.pendingDownloads = tab.pendingDownloads.filter((d) => now - d.at <= PENDING_DOWNLOAD_MS)
-        const waiting = tab.pendingDownloads.shift()
+        const headless = deps.browser.state(tab.profile)?.mode === 'headless'
+        // Before this call headless downloads were denied. A stale failed event
+        // must not immediately consume the newly armed wait and hide its trigger.
+        const waiting = headless ? undefined : tab.pendingDownloads.shift()
+        if (headless) tab.pendingDownloads = []
         return {
           json: await deps.browser.captureDownloads(tab.profile, tab.page, async () => {
             const startedAt = waiting?.at ?? Date.now()
@@ -1217,16 +1236,13 @@ export const TOOL_NAMES = allToolDefs().map((d) => d.spec.name)
 export function createAgentChromeTools(deps: ToolDeps): ToolHandler[] {
   const roots = (): string => {
     try {
-      return deps
-        .guard()
-        .roots.map((r) => (r.startsWith('~') ? r : shownPath(r)))
-        .join(', ')
+      return deps.guard().roots.join(', ')
     } catch {
       return 'the allowed folder'
     }
   }
   const fill = (text: string): string =>
-    text.replace('{downloads}', () => shownPath(deps.downloadsRoot)).replace('{roots}', roots)
+    text.replace('{downloads}', () => deps.downloadsRoot).replace('{roots}', roots)
   return allToolDefs().map((def) => ({
     definition: {
       name: def.spec.name,
