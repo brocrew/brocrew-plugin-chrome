@@ -1,57 +1,14 @@
 /**
- * 🔴 **The leak guard: no new mention of a name this repo must not carry** — launch item 1c.
+ * Prevent private identifiers in tracked contents and filenames using case-insensitive fixed
+ * strings. Read patterns from `BROBOT_LEAK_PATTERNS`, its file variable, or the private config
+ * file. Never print patterns or matching text; give Git its patterns through stdin.
  *
- * ## ⛔ What it is for
+ * Missing patterns may skip contributor checks, but `--require-patterns` refuses that skip for
+ * releases and public exports. A named empty file refuses. The per-file baseline is a shrinking
+ * ratchet; deliberate exceptions require a reason in the allowed list.
  *
- * The tree is to carry no mention of the owner's employer, his home folder, his git handle, his
- * machine or his work email. A scrub removes what is there; new mentions kept arriving after it — a
- * test fixture written the next night carried a home path — so without a guard the scrub would be
- * redone before every release. This is that guard: `git grep` over tracked text files, fixed
- * strings, any case.
- *
- * ## ⛔ The patterns are never in the tree
- *
- * A file naming what must not be named would be the one mention a scrub can never remove. So they
- * come from outside, newline-separated, `#` lines and blank lines ignored, read in this order:
- *  1. `BROBOT_LEAK_PATTERNS` — the patterns themselves (CI sets it from a repository secret);
- *  2. `BROBOT_LEAK_PATTERNS_FILE` — the path of a file holding them;
- *  3. `~/.config/brobot/leak-patterns`, if it exists.
- *
- * With none, it says so and passes: a fork, a contributor and a CI run without the secret are not
- * blocked by a check they cannot run. ⛔ **Except where it is required** (`--require-patterns`): a
- * release, the public repository's own checks and the public export fail with none, since there a
- * skip would let the names through. ⚠️ An empty variable is none (a fork's CI hands a secret it
- * does not have as `''`); a file that is named or present and holds no pattern is a mistake, and
- * refused. ⛔ Nothing it prints names a pattern or a matched line — a public repo's CI log is public
- * — and the patterns reach `git` on its standard input, never on a command line a failure prints.
- *
- * ## ⚑ File names too
- *
- * `git grep` reads contents. A tracked file's PATH carrying a pattern fails as well, whatever the
- * baseline says, and is printed with the pattern hidden.
- *
- * ## ⚑ A ratchet, and the scrub has emptied it
- *
- * `leak-guard/baseline.txt` lists, per file, how many lines carry a mention — paths and counts,
- * never text. A file not listed may carry none, and a listed file no more than its count. ⚑ It only
- * shrinks: a file carrying fewer than its count fails too, so the scrub lowered it (`--shrink`) as
- * it went. The scrub is done and the baseline is empty, so the guard is absolute: any mention in a
- * tracked file fails. A deliberate exception goes in `leak-guard/allowed.txt`, with its reason.
- *
- * ## ⚑ And the commits: `--commits <revisions…>`
- *
- * In a public repository a commit's message and its author and committer are public too. The second
- * mode reads the commits `git log` names for those revisions (`base..head`, or one commit for its
- * whole history) and fails on any of:
- *  - a leak pattern (above) in a message, an author or a committer;
- *  - a commit pattern — the names a message must not carry, which the tree does name — from
- *    `BROBOT_COMMIT_PATTERNS`, `BROBOT_COMMIT_PATTERNS_FILE` or `~/.config/brobot/commit-patterns`,
- *    read as the leak patterns are and never printed;
- *  - a card id in a message ({@link CARD_IDS}): messages are plain words, and the ids belong in the
- *    team's reports;
- *  - when `BROBOT_COMMIT_IDENTITIES` lists them (`Name <email>`, one a line), an author or committer
- *    not on the list, or GitHub's own ({@link GITHUB_IDENTITIES}).
- * With no pattern configured the card ids are still checked, and it says what it could not check.
+ * `--commits` additionally checks messages and identities, using external commit patterns,
+ * {@link CARD_IDS}, the configured identity list and {@link GITHUB_IDENTITIES}.
  */
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'

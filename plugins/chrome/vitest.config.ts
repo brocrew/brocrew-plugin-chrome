@@ -6,6 +6,6 @@ export default defineConfig({
     environment: 'node',
     env: theTestsEnv(),
     setupFiles: [THE_GUARD],
-    include: ['plugins/chrome/test/**/*.test.ts', 'scripts/test/chrome-release-guards.test.mjs'],
+    include: ['plugins/chrome/test/**/*.test.ts'],
   },
 })

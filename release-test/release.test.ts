@@ -19,6 +19,9 @@ it('publishes exactly the built archives and their fixed repository pins, one ta
   expect(entry.targets.map((one: { os: string; cpu: string }) => 'chrome-' + one.os + '-' + one.cpu)).toEqual(names)
   for (const [index, name] of names.entries()) {
     const target = entry.targets[index]
+    const manifest = JSON.parse(fs.readFileSync(path.join(folder!, name, 'package/plugin.json'), 'utf8'))
+    expect(manifest.sourceCommit).toBe(entry.sourceCommit)
+    expect(manifest.sourceCommit).toBe(process.env.BROCREW_PLUGIN_SOURCE_COMMIT)
     const bytes = fs.readFileSync(path.join(folder!, name + '.tar.gz'))
     expect(bytes.length).toBe(target.bytes)
     expect(createHash('sha256').update(bytes).digest('hex')).toBe(target.sha256)
