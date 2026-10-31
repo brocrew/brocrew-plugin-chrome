@@ -8,6 +8,7 @@ export interface ProfileBrowser {
     generation: number
   }>
   close(profile: string): Promise<void>
+  removeWhenIdle(profile: string, remove: () => void): Promise<void>
   state(profile: string): {
     mode: BrowserMode
     generation: number
@@ -16,8 +17,12 @@ export interface ProfileBrowser {
     profile: string,
     opts: {
       newWindow: boolean
+      windowOf?: Page
+      onNote?: (note: string) => void
     },
   ): Promise<Page>
+  windowId(profile: string, page: Page): Promise<number>
+  usePage(profile: string, page: Page): Promise<void>
   onPage(profile: string, cb: (page: Page) => void): () => void
   onClosed(profile: string, cb: (generation: number) => void): () => void
   waitAllPagesClosed(profile: string, timeoutMs: number): Promise<'pages-closed' | 'timeout'>

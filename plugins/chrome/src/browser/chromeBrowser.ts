@@ -1,3 +1,4 @@
+import { ChromiumWindows } from '../shared/browser/chromiumWindows.js'
 import { privateFolder } from '../privatePaths.js'
 import { assertOwnProfileDir } from '../shared/browser/launchGuard.js'
 import fs from 'node:fs'
@@ -36,6 +37,7 @@ export const KILL_GRACE_MS = 3000
 export const WAIT_POLL_MS = 1500
 export interface ChromeBrowserOptions {
   dirOf: (profile: string) => string
+  profileExists?: (profile: string) => boolean
   logger?: Logger
   idleMs?: number
   afterIdleClose?: (profile: string) => void | Promise<void>
@@ -68,10 +70,13 @@ interface Entry {
   sync: boolean
   generation: number
   initial: Page[]
+  windows: ChromiumWindows | null
   waiters: number
   idleTimer: ReturnType<typeof setTimeout> | null
   touched: number
   life: Promise<unknown>
+  lifePending: number
+  removing: boolean
   pageListeners: Set<(page: Page) => void>
   closedListeners: Set<(generation: number) => void>
   endedHooks: Array<() => void>
@@ -164,7 +169,10 @@ export class ChromeBrowser implements ProfileBrowser {
         read: createUaReader(this.choice),
         fallback: fallbackUaFor(),
         onFallback: (reason, used) =>
-          this.logger.warn('Chrome UA read failed, using a stand-in', { reason, used }),
+          this.logger.warn('Chrome UA read failed, using a stand-in', {
+            reason,
+            used,
+          }),
       })
     this.idleMs = opts.idleMs ?? IDLE_MS
     this.later = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
@@ -188,10 +196,13 @@ export class ChromeBrowser implements ProfileBrowser {
         sync: false,
         generation: 0,
         initial: [],
+        windows: null,
         waiters: 0,
         idleTimer: null,
         touched: 0,
         life: Promise.resolve(),
+        lifePending: 0,
+        removing: false,
         pageListeners: new Set(),
         closedListeners: new Set(),
         downloads: null,
@@ -202,12 +213,17 @@ export class ChromeBrowser implements ProfileBrowser {
     return e
   }
   private lifecycle<T>(e: Entry, fn: () => Promise<T>): Promise<T> {
+    if (e.removing) return Promise.reject(new ProfileInUseError())
+    e.lifePending++
     const run = e.life.then(fn, fn)
-    e.life = run.then(
+    const settled = run.finally(() => {
+      e.lifePending--
+    })
+    e.life = settled.then(
       () => undefined,
       () => undefined,
     )
-    return run
+    return settled
   }
   dir(profile: string): string {
     return this.opts.dirOf(profile)
@@ -226,6 +242,8 @@ export class ChromeBrowser implements ProfileBrowser {
     generation: number
   }> {
     if (this.shuttingDown) throw new Error('the server is shutting down')
+    if (this.opts.profileExists?.(profile) === false) throw new Error('profile does not exist')
+    if (this.entries.get(profile)?.removing) throw new ProfileInUseError()
     const dir = this.dir(profile)
     const e = this.entry(profile)
     return this.lifecycle(e, async () => {
@@ -265,6 +283,7 @@ export class ChromeBrowser implements ProfileBrowser {
         profileDir: dir,
         channel: this.choice.channel,
         mode,
+        background: true,
         sync,
         extensions,
         noSandbox: this.opts.noSandbox === true,
@@ -304,7 +323,9 @@ export class ChromeBrowser implements ProfileBrowser {
         if (stagingDir) fs.rmSync(stagingDir, { recursive: true, force: true })
         throw err
       }
-      this.logger.warn('browser launch failed, re-reading the Chrome UA once', { mode })
+      this.logger.warn('browser launch failed, re-reading the Chrome UA once', {
+        mode,
+      })
       this.ua.invalidate()
       const options = await build()
       assertOwnProfileDir(options)
@@ -331,14 +352,19 @@ export class ChromeBrowser implements ProfileBrowser {
     e.sync = sync
     e.generation = generation
     e.downloads = nativeDownloads
-    e.initial = ctx.pages()
-    ctx.on('page', (page) => {
+    e.windows = new ChromiumWindows(ctx, undefined, undefined, undefined, (page) => {
       if (e.ctx !== ctx) return
       for (const cb of [...e.pageListeners]) cb(page)
     })
+    e.initial = ctx.pages()
     ctx.on('close', () => this.ended(e, ctx, generation))
     ctx.browser()?.on('disconnected', () => this.ended(e, ctx, generation))
-    this.logger.info('browser launched', { mode, generation, extensions, sync })
+    this.logger.info('browser launched', {
+      mode,
+      generation,
+      extensions,
+      sync,
+    })
     this.armIdle(e)
     return generation
   }
@@ -351,7 +377,10 @@ export class ChromeBrowser implements ProfileBrowser {
       else {
         for (const entry of fs.readdirSync(e.downloads.dir))
           if (!kept.has(entry))
-            fs.rmSync(path.join(e.downloads.dir, entry), { recursive: true, force: true })
+            fs.rmSync(path.join(e.downloads.dir, entry), {
+              recursive: true,
+              force: true,
+            })
         this.logger.warn(
           'downloads of the user could not be placed and stay in the staging folder',
           { count: kept.size, dir: e.downloads.dir },
@@ -361,6 +390,7 @@ export class ChromeBrowser implements ProfileBrowser {
     e.downloads = null
     e.ctx = null
     e.initial = []
+    e.windows = null
     this.clearIdle(e)
     for (const hook of e.endedHooks.splice(0)) hook()
     for (const cb of [...e.closedListeners]) {
@@ -491,7 +521,9 @@ export class ChromeBrowser implements ProfileBrowser {
     const ctx = e.ctx
     if (!ctx) return
     const { generation } = e
-    const closed = settledWithin(ctx.close(), this.closeMs).then((ok) => ({ ok }))
+    const closed = settledWithin(ctx.close(), this.closeMs).then((ok) => ({
+      ok,
+    }))
     let graceTimer: ReturnType<typeof setTimeout> | undefined
     const lingering = new Promise<{
       ok: false
@@ -553,34 +585,30 @@ export class ChromeBrowser implements ProfileBrowser {
   }
   async newPage(
     profile: string,
-    opts: {
-      newWindow: boolean
-    },
+    opts: { newWindow: boolean; windowOf?: Page; onNote?: (note: string) => void },
   ): Promise<Page> {
     const e = this.entries.get(profile)
     const ctx = e?.ctx
-    if (!e || !ctx) throw new Error('profile is not open')
-    const reuse = e.initial.find(isBlank)
+    if (!e || !ctx || !e.windows) throw new Error('profile is not open')
+    const emptyLaunchWindow =
+      e.initial.length > 0 && ctx.pages().every((page) => e.initial.includes(page) && isBlank(page))
+    const reuse = !opts.windowOf && emptyLaunchWindow ? e.initial.find(isBlank) : undefined
     e.initial = []
     if (reuse) return reuse
-    if (opts.newWindow && e.mode === 'visible') return this.newWindowPage(ctx)
-    return ctx.newPage()
+    return e.windows.open({
+      ...opts,
+      newWindow: opts.newWindow && e.mode === 'visible',
+    })
   }
-  private async newWindowPage(ctx: BrowserContext): Promise<Page> {
-    const anchor = ctx.pages()[0]
-    if (!anchor) return ctx.newPage()
-    const session = await ctx.newCDPSession(anchor)
-    try {
-      const appeared = ctx.waitForEvent('page', { timeout: 10000 })
-      await session.send('Target.createTarget', {
-        url: 'about:blank',
-        newWindow: true,
-        background: true,
-      })
-      return await appeared
-    } finally {
-      await session.detach().catch(() => undefined)
-    }
+  async windowId(profile: string, page: Page): Promise<number> {
+    const windows = this.entries.get(profile)?.windows
+    if (!windows) throw new Error('profile is not open')
+    return windows.windowId(page)
+  }
+  async usePage(profile: string, page: Page): Promise<void> {
+    const windows = this.entries.get(profile)?.windows
+    if (!windows) throw new Error('profile is not open')
+    await windows.used(page)
   }
   onPage(profile: string, cb: (page: Page) => void): () => void {
     const e = this.entry(profile)
@@ -637,14 +665,40 @@ export class ChromeBrowser implements ProfileBrowser {
       e.waiters--
       if (timer) clearTimeout(timer)
       if (poll) clearInterval(poll)
-      this.logger.info('window wait ended', { reason, ms: Date.now() - started })
+      this.logger.info('window wait ended', {
+        reason,
+        ms: Date.now() - started,
+      })
     }
   }
   exclusive<T>(profile: string, fn: () => Promise<T>): Promise<T> {
     return this.serializer.runExclusive(profile, fn)
   }
+  /** A person may remove closed data only while no browser work can acquire it. */
+  removeWhenIdle(profile: string, remove: () => void): Promise<void> {
+    return this.exclusive(profile, async () => {
+      const e = this.entry(profile)
+      const busy = () =>
+        e.ctx !== null ||
+        e.lifePending > 0 ||
+        e.waiters > 0 ||
+        e.barrier.inFlight() > 0 ||
+        e.barrier.isTransitioning()
+      if (e.removing || busy()) throw new ProfileInUseError()
+      e.removing = true
+      try {
+        if (await this.lockHeld(this.dir(profile))) throw new ProfileInUseError()
+        if (busy()) throw new ProfileInUseError()
+        remove()
+      } finally {
+        e.removing = false
+      }
+    })
+  }
   operate<T>(profile: string, fn: () => Promise<T>): Promise<T> {
-    return this.entry(profile).barrier.runOp(fn)
+    const e = this.entry(profile)
+    if (e.removing) return Promise.reject(new ProfileInUseError())
+    return e.barrier.runOp(fn)
   }
   touch(profile: string): void {
     const e = this.entries.get(profile)
