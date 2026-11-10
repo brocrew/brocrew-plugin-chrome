@@ -1,0 +1,493 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { EventEmitter } from 'node:events'
+import { afterEach, expect, it, vi } from 'vitest'
+import type { BrowserContext, Page } from 'playwright-core'
+import { FakeDownload, harness } from './fakes.js'
+import { buildToolDefs, createAgentChromeTools } from '../src/tools/index.js'
+import { ChromeBrowser } from '../src/browser/chromeBrowser.js'
+const fixtures: ReturnType<typeof harness>[] = []
+const routedBrowsers: ChromeBrowser[] = []
+afterEach(async () => {
+  for (const browser of routedBrowsers.splice(0)) await browser.closeAll()
+  for (const h of fixtures.splice(0)) {
+    await h.browser.close('fern')
+    for (const root of [h.home, path.dirname(h.downloads), h.uploadRoot])
+      fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+async function setup(visible = false) {
+  const h = harness()
+  fixtures.push(h)
+  h.profile('fern', { enabled: true })
+  const opened = (
+    await h.call('open_tab', { profile: 'fern', url: 'https://fictional.invalid/', visible })
+  ).json as { tabId: string }
+  const page = h.browser.pages.get('fern')![0]
+  let active = false
+  let armed!: () => void
+  const ready = new Promise<void>((resolve) => {
+    armed = resolve
+  })
+  h.browser.captureDownloads = async <T>(_profile: string, _page: Page, fn: () => Promise<T>) => {
+    active = true
+    armed()
+    try {
+      return await fn()
+    } finally {
+      active = false
+    }
+  }
+  const download = (name: string) => {
+    const file = path.join(h.home, name)
+    fs.writeFileSync(file, 'fictional bytes')
+    return new FakeDownload(name, Buffer.from('fictional bytes'), file)
+  }
+  return { h, page, tabId: opened.tabId, active: () => active, ready, download }
+}
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve))
+async function routed(visible = true) {
+  const f = await setup(visible)
+  const native = path.join(f.h.home, 'routed-downloads')
+  const profile = path.join(f.h.home, 'routed-profiles', 'fern')
+  fs.mkdirSync(profile, { recursive: true })
+  let stage = ''
+  let ended = false
+  const session = Object.assign(new EventEmitter(), {
+    send: vi.fn(async () => undefined),
+  })
+  const driver = Object.assign(new EventEmitter(), {
+    newBrowserCDPSession: async () => session,
+    isConnected: () => !ended,
+  })
+  const context = Object.assign(new EventEmitter(), {
+    browser: () => driver,
+    pages: () => [],
+    newCDPSession: async () => ({
+      send: async () => ({ frameTree: { frame: { id: 'fern-frame' } } }),
+      detach: async () => undefined,
+    }),
+    close: async () => {
+      ended = true
+      context.emit('close')
+    },
+  })
+  const browser = new ChromeBrowser({
+    dirOf: () => profile,
+    downloadsRoot: native,
+    homedir: () => f.h.home,
+    lockHeld: async () => false,
+    killChrome: async () => {
+      throw new Error('No real browser should be ended')
+    },
+    ua: {
+      get: async () => ({ userAgent: 'fictional', chromeVersion: '1' }),
+      invalidate() {},
+      peek: () => null,
+    },
+    launchContext: async (options) => {
+      stage = options.downloadsPath!
+      return context as unknown as BrowserContext
+    },
+  })
+  routedBrowsers.push(browser)
+  await browser.ensure('fern', visible ? 'visible' : 'headless')
+  f.h.browser.captureDownloads = browser.captureDownloads.bind(browser)
+  const begin = (guid: string, name = 'fresh.txt') => {
+    fs.writeFileSync(path.join(stage, guid), 'fresh bytes')
+    session.emit('Browser.downloadWillBegin', {
+      guid,
+      frameId: 'fern-frame',
+      suggestedFilename: name,
+    })
+  }
+  const complete = (guid: string) =>
+    session.emit('Browser.downloadProgress', {
+      guid,
+      receivedBytes: 11,
+      totalBytes: 11,
+      state: 'completed',
+    })
+  return { ...f, stage, native, session, begin, complete, routedBrowser: browser }
+}
+it.each([false, true])(
+  'arms capture before navigation and saves its download (navigation abort=%s)',
+  async (aborted) => {
+    const f = await setup()
+    const download = f.download('paper.txt')
+    f.page.goto = vi.fn(async () => {
+      expect(f.active()).toBe(true)
+      f.page.emit('download', download)
+      if (aborted) throw new Error('net::ERR_ABORTED; Download is starting')
+      return { status: () => 200 }
+    })
+    const result = (
+      await f.h.call('download', { tabId: f.tabId, url: 'https://fictional.invalid/paper.txt' })
+    ).json as { path: string; bytes: number }
+    expect(fs.readFileSync(result.path, 'utf8')).toBe('fictional bytes')
+    expect(download.deleted).toBe(true)
+    expect(f.active()).toBe(false)
+  },
+)
+it('arms a fresh headless wait instead of consuming an earlier denied download', async () => {
+  const f = await setup()
+  const stale = f.download('denied.txt')
+  const deniedPath = vi
+    .spyOn(stale, 'path')
+    .mockRejectedValue(new Error('fictional denied download'))
+  const tab = f.h.tabs.resolve(f.tabId, (profile) => f.h.browser.state(profile)?.generation ?? null)
+  tab.pendingDownloads.push({ download: stale as never, at: Date.now() })
+  const pending = f.h.call('wait_for_download', { tabId: f.tabId })
+  await f.ready
+  expect(f.active()).toBe(true)
+  f.page.emit('download', f.download('fresh.txt'))
+  const result = (await pending).json as { path: string }
+  expect(fs.readFileSync(result.path, 'utf8')).toBe('fictional bytes')
+  expect(deniedPath).not.toHaveBeenCalled()
+  expect(f.active()).toBe(false)
+})
+it('guides agent downloads to one call and reserves waits for independent events', async () => {
+  const f = await setup()
+  const definition = buildToolDefs().find((d) => d.spec.name === 'wait_for_download')!
+  expect(definition.spec.description).toContain('page timer')
+  expect(definition.spec.description).toContain('user in a visible window')
+  expect(definition.spec.description).toContain('use download with ref or url')
+  expect(definition.spec.description).toContain('Only one tool call runs at a time')
+  expect(definition.spec.description).not.toMatch(/parallel|start this wait before the action/i)
+  await expect(
+    f.h.call('download', { tabId: f.tabId, ref: 'e1', url: 'https://fictional.invalid/' }),
+  ).rejects.toThrow('give exactly one')
+  expect(f.active()).toBe(false)
+})
+
+it('retains an earlier visible-window download without waiting for another event', async () => {
+  const f = await setup(true)
+  const saved = f.download('visible.txt')
+  const tab = f.h.tabs.resolve(f.tabId, (profile) => f.h.browser.state(profile)?.generation ?? null)
+  tab.pendingDownloads.push({ download: saved as never, at: Date.now() })
+  const result = (await f.h.call('wait_for_download', { tabId: f.tabId })).json as { path: string }
+  expect(fs.readFileSync(result.path, 'utf8')).toBe('fictional bytes')
+  expect(saved.deleted).toBe(true)
+})
+
+it.each([false, true])(
+  'observes an earlier GUID without taking its capture ownership (cancelled=%s)',
+  async (cancelled) => {
+    const f = await routed()
+    const ownerReady = Promise.withResolvers<void>()
+    const ownerRelease = Promise.withResolvers<void>()
+    const ownerProgress = vi.fn()
+    const original = f.routedBrowser.captureDownloads(
+      'fern',
+      f.page as never,
+      async () => {
+        f.begin('earlier-guid', 'earlier.txt')
+        await flush()
+        ownerReady.resolve()
+        await ownerRelease.promise
+      },
+      undefined,
+      ownerProgress,
+    )
+    await ownerReady.promise
+    const download = new FakeDownload(
+      'earlier.txt',
+      Buffer.from('fresh bytes'),
+      path.join(f.stage, 'earlier-guid'),
+    )
+    const pathReady = Promise.withResolvers<void>()
+    const pathRelease = Promise.withResolvers<void>()
+    vi.spyOn(download, 'path').mockImplementation(async () => {
+      pathReady.resolve()
+      await pathRelease.promise
+      return download.file
+    })
+    const tab = f.h.tabs.resolve(f.tabId, (name) => f.h.browser.state(name)?.generation ?? null)
+    tab.pendingDownloads.push({ download: download as never, at: Date.now() })
+    const activity = vi.fn()
+    const cancellation = new AbortController()
+    const tool = createAgentChromeTools(f.h.deps).find(
+      (entry) => entry.definition.name === 'wait_for_download',
+    )!
+    const waiting = tool.execute({ tabId: f.tabId }, { activity, signal: cancellation.signal })
+    try {
+      await pathReady.promise
+      f.begin('unrelated-guid', 'unrelated.txt')
+      await flush()
+      for (const bytes of [2, 2, 1, 5])
+        f.session.emit('Browser.downloadProgress', {
+          guid: 'earlier-guid',
+          state: 'inProgress',
+          receivedBytes: bytes,
+          totalBytes: 11,
+        })
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'unrelated-guid',
+        state: 'inProgress',
+        receivedBytes: 6,
+        totalBytes: 11,
+      })
+      const count = activity.mock.calls.filter(([stage]) => stage === 'download-received').length
+      expect(ownerProgress).toHaveBeenCalledTimes(2)
+      expect(count).toBe(2)
+      if (cancelled) {
+        cancellation.abort()
+        f.session.emit('Browser.downloadProgress', {
+          guid: 'earlier-guid',
+          state: 'inProgress',
+          receivedBytes: 6,
+          totalBytes: 11,
+        })
+        expect(activity.mock.calls.filter(([stage]) => stage === 'download-received')).toHaveLength(
+          count,
+        )
+      }
+    } finally {
+      pathRelease.resolve()
+      await waiting
+      const afterSave = activity.mock.calls.length
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'earlier-guid',
+        state: 'inProgress',
+        receivedBytes: 8,
+        totalBytes: 11,
+      })
+      expect(activity).toHaveBeenCalledTimes(afterSave)
+      expect(ownerProgress).toHaveBeenCalledTimes(cancelled ? 4 : 3)
+      ownerRelease.resolve()
+      await original
+    }
+  },
+)
+
+it.each([false, true])(
+  'saving a queued download preserves a fresh user download (completed before save=%s)',
+  async (completed) => {
+    const f = await routed()
+    const olderPath = path.join(f.stage, 'older-guid')
+    fs.writeFileSync(olderPath, 'older bytes')
+    const older = new FakeDownload('older.txt', Buffer.from('older bytes'), olderPath)
+    const preparing = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    vi.spyOn(older, 'path').mockImplementation(async () => {
+      preparing.resolve()
+      await release.promise
+      return olderPath
+    })
+    const tab = f.h.tabs.resolve(f.tabId, (name) => f.h.browser.state(name)?.generation ?? null)
+    tab.pendingDownloads.push({ download: older as never, at: Date.now() })
+    const saving = f.h.call('wait_for_download', { tabId: f.tabId })
+    try {
+      await preparing.promise
+      f.begin('fresh-guid')
+      await flush()
+      if (completed) f.complete('fresh-guid')
+    } finally {
+      release.resolve()
+    }
+    const result = (await saving).json as { path: string }
+    expect(fs.readFileSync(result.path, 'utf8')).toBe('older bytes')
+    if (!completed) f.complete('fresh-guid')
+    await vi.waitFor(() =>
+      expect(fs.readFileSync(path.join(f.native, 'fresh.txt'), 'utf8')).toBe('fresh bytes'),
+    )
+    expect(f.session.send).not.toHaveBeenCalledWith('Browser.cancelDownload', {
+      guid: 'fresh-guid',
+    })
+  },
+)
+
+it('releases a fresh claim after saving that same download', async () => {
+  const f = await routed()
+  const fresh = new FakeDownload(
+    'fresh.txt',
+    Buffer.from('fresh bytes'),
+    path.join(f.stage, 'fresh-guid'),
+  )
+  f.page.goto = vi.fn(async () => {
+    f.begin('fresh-guid')
+    await flush()
+    f.page.emit('download', fresh)
+    return { status: () => 200 }
+  })
+  const result = (
+    await f.h.call('download', { tabId: f.tabId, url: 'https://fictional.invalid/fresh.txt' })
+  ).json as { path: string }
+  expect(fs.readFileSync(result.path, 'utf8')).toBe('fresh bytes')
+  f.complete('fresh-guid')
+  await vi.waitFor(() => expect(fs.existsSync(path.join(f.stage, 'fresh-guid'))).toBe(false))
+  expect(fs.existsSync(path.join(f.native, 'fresh.txt'))).toBe(false)
+  expect(f.session.send).not.toHaveBeenCalledWith('Browser.cancelDownload', {
+    guid: 'fresh-guid',
+  })
+})
+
+it('reports owned advancing bytes and lets a default download outlast the action budget', async () => {
+  const f = await routed()
+  const file = path.join(f.stage, 'activity-guid')
+  const download = new FakeDownload('fresh.txt', Buffer.from('fresh bytes'), file)
+  const ready = Promise.withResolvers<void>()
+  const saved = Promise.withResolvers<string>()
+  download.path = () => {
+    ready.resolve()
+    return saved.promise
+  }
+  const stages: string[] = []
+  f.page.goto = vi.fn(async () => {
+    f.begin('activity-guid')
+    await flush()
+    for (const receivedBytes of [5, 5, 4, 11])
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'activity-guid',
+        receivedBytes,
+        totalBytes: 11,
+        state: 'inProgress',
+      })
+    expect(stages).toEqual(['page-ready', 'download-received', 'download-received'])
+    f.page.emit('download', download)
+    return { status: () => 200 }
+  })
+  const tool = createAgentChromeTools(f.h.deps).find((one) => one.definition.name === 'download')!
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  let ended = false
+  const pending = tool.execute(
+    { tabId: f.tabId, url: 'https://fictional.invalid/fresh.txt' },
+    { activity: (stage) => stages.push(stage) },
+  )
+  void pending.then(
+    () => {
+      ended = true
+    },
+    () => {
+      ended = true
+    },
+  )
+  try {
+    await ready.promise
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(ended).toBe(false)
+    f.complete('activity-guid')
+    saved.resolve(file)
+    await pending
+    expect(stages.at(-1)).toBe('download-saved')
+  } finally {
+    saved.resolve(file)
+    vi.useRealTimers()
+    await pending.catch(() => undefined)
+  }
+})
+
+it('keeps a user download when the wait times out before receiving its event', async () => {
+  const f = await routed()
+  const armed = Promise.withResolvers<void>()
+  const event = Promise.withResolvers<never>()
+  f.page.waitForEvent = vi.fn(() => {
+    armed.resolve()
+    return event.promise
+  })
+  const failed = expect(f.h.call('wait_for_download', { tabId: f.tabId })).rejects.toThrow(
+    'fictional timeout',
+  )
+  await armed.promise
+  f.begin('fresh-guid')
+  await flush()
+  event.reject(Object.assign(new Error('fictional timeout'), { name: 'TimeoutError' }))
+  await failed
+  f.complete('fresh-guid')
+  await vi.waitFor(() =>
+    expect(fs.readFileSync(path.join(f.native, 'fresh.txt'), 'utf8')).toBe('fresh bytes'),
+  )
+})
+
+it('ignores a delayed public page event while waiting for a fresh private download', async () => {
+  const f = await routed()
+  Object.assign(f.h.browser, {
+    agentCall: f.routedBrowser.agentCall.bind(f.routedBrowser),
+    downloadIsPrivate: f.routedBrowser.downloadIsPrivate.bind(f.routedBrowser),
+  })
+  f.begin('earlier-public', 'public-paper.txt')
+  const native = new FakeDownload(
+    'public-paper.txt',
+    Buffer.from('native bytes'),
+    path.join(f.stage, 'earlier-public'),
+  )
+  const cancel = vi.spyOn(native, 'cancel')
+  const ready = Promise.withResolvers<void>()
+  const wait = f.page.waitForEvent.bind(f.page)
+  f.page.waitForEvent = vi.fn((event, opts) => {
+    ready.resolve()
+    return wait(event, opts)
+  })
+  const result = f.h.call('wait_for_download', { tabId: f.tabId })
+  await ready.promise
+  f.page.emit('download', native)
+  f.begin('fresh-private', 'private-paper.txt')
+  const fresh = new FakeDownload(
+    'private-paper.txt',
+    Buffer.from('fresh bytes'),
+    path.join(f.stage, 'fresh-private'),
+  )
+  f.page.emit('download', fresh)
+  f.complete('fresh-private')
+  const saved = (await result).json as { path: string }
+  expect(fs.readFileSync(saved.path, 'utf8')).toBe('fresh bytes')
+  expect(native.deleted).toBe(false)
+  expect(cancel).not.toHaveBeenCalled()
+})
+it('refuses a public item injected into pending recovery without deleting or canceling it', async () => {
+  const f = await routed()
+  Object.assign(f.h.browser, {
+    agentCall: f.routedBrowser.agentCall.bind(f.routedBrowser),
+    downloadIsPrivate: f.routedBrowser.downloadIsPrivate.bind(f.routedBrowser),
+  })
+  f.begin('public-recovery', 'public-paper.txt')
+  const normal = new FakeDownload(
+    'public-paper.txt',
+    Buffer.from('native bytes'),
+    path.join(f.stage, 'public-recovery'),
+  )
+  const cancel = vi.spyOn(normal, 'cancel')
+  const tab = f.h.tabs.resolve(f.tabId, (name) => f.h.browser.state(name)?.generation ?? null)
+  tab.pendingDownloads.push({ download: normal as never, at: Date.now() })
+  await expect(f.h.call('wait_for_download', { tabId: f.tabId })).rejects.toThrow('download failed')
+  expect(normal.deleted).toBe(false)
+  expect(cancel).not.toHaveBeenCalled()
+})
+
+it('refuses a private-attributed artifact whose real path is a native file without copying or cleanup', async () => {
+  const f = await routed()
+  Object.assign(f.h.browser, {
+    agentCall: f.routedBrowser.agentCall.bind(f.routedBrowser),
+    downloadIsPrivate: f.routedBrowser.downloadIsPrivate.bind(f.routedBrowser),
+    downloadFileIsPrivate: f.routedBrowser.downloadFileIsPrivate.bind(f.routedBrowser),
+    deletePrivateDownload: f.routedBrowser.deletePrivateDownload.bind(f.routedBrowser),
+    cancelPrivateDownload: f.routedBrowser.cancelPrivateDownload.bind(f.routedBrowser),
+  })
+  const normal = path.join(f.h.home, 'Downloads', 'fictional-normal.txt')
+  fs.mkdirSync(path.dirname(normal))
+  fs.writeFileSync(normal, 'fictional native bytes')
+  const source = path.join(f.stage, 'private-linked-guid')
+  fs.symlinkSync(normal, source)
+  const linked = new FakeDownload(
+    'fictional-normal.txt',
+    Buffer.from('fictional native bytes'),
+    source,
+  )
+  const deletion = vi.spyOn(linked, 'delete'),
+    cancel = vi.spyOn(linked, 'cancel')
+  f.page.goto = vi.fn(async () => {
+    f.session.emit('Browser.downloadWillBegin', {
+      guid: 'private-linked-guid',
+      frameId: 'fern-frame',
+      suggestedFilename: 'fictional-normal.txt',
+    })
+    f.page.emit('download', linked)
+    return { status: () => 200 }
+  })
+  await expect(
+    f.h.call('download', { tabId: f.tabId, url: 'https://fictional.invalid/paper' }),
+  ).rejects.toThrow('download failed')
+  expect(deletion).not.toHaveBeenCalled()
+  expect(cancel).not.toHaveBeenCalled()
+  expect(fs.readFileSync(normal, 'utf8')).toBe('fictional native bytes')
+})
