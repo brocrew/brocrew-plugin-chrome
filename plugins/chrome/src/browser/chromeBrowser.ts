@@ -1,6 +1,6 @@
 import { ChromiumWindows } from '../shared/browser/chromiumWindows.js'
 import { BrocrewHelper, offInLastSession } from './brocrewHelper.js'
-import type { HelperSwitch } from '../profiles/store.js'
+import type { HelperSwitch } from '../profiles/sharedTypes.js'
 import type { HelperState } from './brocrewHelper.js'
 import { privateFolder } from '../privatePaths.js'
 import { assertOwnProfileDir } from '../shared/browser/launchGuard.js'
@@ -58,7 +58,6 @@ export interface ChromeBrowserOptions {
   afterIdleClose?: (profile: string) => void | Promise<void>
   extensionsFor?: (profile: string) => boolean
   syncFor?: (profile: string) => boolean
-  keepRunningFor?: (profile: string) => boolean
   homedir?: () => string
   downloadsRoot?: string
   nativeDownloadsInHeadless?: boolean
@@ -534,7 +533,6 @@ export class ChromeBrowser implements ProfileBrowser {
   private downloadRoot(profileDir: string): string {
     const root = this.opts.downloadsRoot ?? path.join(profileDir, 'downloads')
     privateFolder(path.dirname(root), root, true)
-    if (process.platform !== 'win32') fs.chmodSync(root, 0o700)
     return root
   }
   private privateDownloadStage(profileDir: string): string {
@@ -733,6 +731,8 @@ export class ChromeBrowser implements ProfileBrowser {
     page: Page,
     fn: () => Promise<T>,
     savedFile?: () => string | undefined,
+    onprogress?: () => void,
+    existing?: { download: Download; signal?: AbortSignal },
   ): Promise<T> {
     const e = this.entries.get(profile)
     const d = e?.downloads
@@ -747,21 +747,32 @@ export class ChromeBrowser implements ProfileBrowser {
     const held: {
       session?: Promise<CDPSession>
     } = {}
-    const capture = d.router.capture(async () => {
-      held.session ??= ctx.newCDPSession(unwrapBrowserHandle(page))
-      const session = await held.session
-      check()
-      const tree = (await session.send('Page.getFrameTree')) as {
-        frameTree: FrameTree
-      }
-      check()
-      return frameIdsOf(tree.frameTree)
-    })
+    const capture = d.router.capture(
+      async () => {
+        held.session ??= ctx.newCDPSession(unwrapBrowserHandle(page))
+        const session = await held.session
+        check()
+        const tree = (await session.send('Page.getFrameTree')) as {
+          frameTree: FrameTree
+        }
+        check()
+        return frameIdsOf(tree.frameTree)
+      },
+      existing ? undefined : onprogress,
+    )
     let completed = false
     let savedGuid: string | undefined
+    let unobserve = () => {}
+    const stopObserving = () => unobserve()
     try {
       await apply()
       check()
+      if (existing && onprogress && !existing.signal?.aborted) {
+        const file = this.artifactPath(existing.download)
+        if (file && path.dirname(file) === d.dir)
+          unobserve = d.router.observe(path.basename(file), onprogress)
+        existing.signal?.addEventListener('abort', stopObserving, { once: true })
+      }
       const result = await fn()
       check()
       const saved = savedFile?.()
@@ -772,6 +783,8 @@ export class ChromeBrowser implements ProfileBrowser {
       completed = true
       return result
     } finally {
+      stopObserving()
+      existing?.signal?.removeEventListener('abort', stopObserving)
       capture.end(completed, savedGuid)
       void held.session?.then((s) => s.detach()).catch(() => undefined)
       d.captures--
@@ -824,24 +837,6 @@ export class ChromeBrowser implements ProfileBrowser {
       if (e.ctx) await e.barrier.transition(() => this.closeNow(e))
       else this.releaseLease(e)
     })
-  }
-  visiblePages(): Array<{
-    profile: string
-    urls: string[]
-  }> {
-    const out: Array<{
-      profile: string
-      urls: string[]
-    }> = []
-    for (const e of this.entries.values()) {
-      if (!e.ctx || e.mode !== 'visible') continue
-      try {
-        out.push({ profile: e.name, urls: e.ctx.pages().map((p) => p.url()) })
-      } catch {
-        /* Continue without this optional result. */
-      }
-    }
-    return out
   }
   async closeAll(): Promise<void> {
     this.shuttingDown = true
@@ -1005,8 +1000,7 @@ export class ChromeBrowser implements ProfileBrowser {
   private idleFired(e: Entry): void {
     e.idleTimer = null
     if (!e.ctx || e.mode === 'visible') return
-    const kept = this.opts.keepRunningFor?.(e.name) === true
-    if (kept || e.waiters > 0 || e.barrier.inFlight() > 0) {
+    if (e.waiters > 0 || e.barrier.inFlight() > 0) {
       e.idleTimer = this.later(() => this.idleFired(e), this.idleMs)
       e.idleTimer.unref?.()
       return
@@ -1014,7 +1008,7 @@ export class ChromeBrowser implements ProfileBrowser {
     const { generation, touched } = e
     void this.exclusive(e.name, async () => {
       if (e.generation !== generation || e.touched !== touched) return
-      if (e.mode === 'visible' || this.opts.keepRunningFor?.(e.name) === true) return
+      if (e.mode === 'visible') return
       this.logger.info('idle close', { generation })
       await this.close(e.name)
       await this.opts.afterIdleClose?.(e.name)

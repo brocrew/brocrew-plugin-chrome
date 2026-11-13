@@ -5,16 +5,20 @@ import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-export class PublicToolError extends Error {}
-export interface ToolDefinition {
-  name: string
-  description: string
-  inputSchema: {
-    type: 'object'
-    properties: Record<string, unknown>
-    required?: string[]
-    additionalProperties?: boolean
-  }
+import { dispatchTool, type ToolDefinition } from '../../../shared/tool-dispatch.js'
+export { PublicToolError } from '../../../shared/tool-dispatch.js'
+export type { ToolDefinition } from '../../../shared/tool-dispatch.js'
+export type ToolActivity =
+  | 'browser-ready'
+  | 'page-ready'
+  | 'page-response'
+  | 'page-loaded'
+  | 'screenshot-captured'
+  | 'download-received'
+  | 'download-saved'
+interface ToolContext extends Record<string, unknown> {
+  signal?: AbortSignal
+  activity?: (stage: ToolActivity) => void
 }
 export type ToolResult = {
   content: Array<{
@@ -24,10 +28,7 @@ export type ToolResult = {
 }
 export interface ToolHandler {
   definition: ToolDefinition
-  execute(
-    args: Record<string, unknown>,
-    context: Record<string, unknown>,
-  ): ToolResult | Promise<ToolResult>
+  execute(args: Record<string, unknown>, context: ToolContext): ToolResult | Promise<ToolResult>
 }
 export interface StaticResource {
   uri: string
@@ -54,21 +55,30 @@ export function createToolServer(options: ToolServerOptions): Server {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: tools.map((t) => t.definition),
   }))
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name: toolName, arguments: args } = request.params
-    const tool = tools.find((t) => t.definition.name === toolName)
-    if (!tool) {
-      return { content: [{ type: 'text', text: `Unknown tool: ${toolName}` }] }
-    }
-    try {
-      return await tool.execute((args as Record<string, unknown>) ?? {}, context)
-    } catch (err: unknown) {
-      const msg =
-        err instanceof PublicToolError
-          ? err.message.slice(0, 2000)
-          : 'Plugin unavailable. Try again.'
-      return { content: [{ type: 'text', text: `Error: ${msg}` }] }
-    }
+    let active = true
+    let progress = 0
+    return dispatchTool(tools, toolName, args, async (tool, parsed) => {
+      try {
+        return await tool.execute(parsed, {
+          ...context,
+          signal: extra.signal,
+          activity(stage) {
+            const progressToken = request.params._meta?.progressToken
+            if (active && !extra.signal.aborted && progressToken !== undefined)
+              void extra
+                .sendNotification({
+                  method: 'notifications/progress',
+                  params: { progressToken, progress: ++progress, message: stage },
+                })
+                .catch(() => undefined)
+          },
+        })
+      } finally {
+        active = false
+      }
+    })
   })
   if (resources.length > 0) {
     server.setRequestHandler(ListResourcesRequestSchema, async () => ({

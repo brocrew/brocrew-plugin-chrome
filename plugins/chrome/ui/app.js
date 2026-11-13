@@ -1,8 +1,9 @@
-const channel = 'brocrew-plugin-ui:v1'
-const pending = new Map()
 let revision = 0
-let next = 0
 let closed = false
+const { rpc, pending } = window.createPluginUiRpc(
+  () => revision,
+  () => closed,
+)
 let deleting = null
 let deletionError = ''
 let deletionPending = false
@@ -32,32 +33,6 @@ function say(words, tone) {
   status.textContent = words
   status.dataset.tone = tone
 }
-function rpc(method, payload) {
-  if (pending.size >= 4 || closed) return Promise.reject(new Error('busy'))
-  const requestId = String(++next)
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pending.delete(requestId)
-      reject(new Error('timeout'))
-    }, 10000)
-    pending.set(requestId, { resolve, reject, timer })
-    window.postMessage(
-      { channel, requestId, method, payload, configRevision: revision },
-      location.origin,
-    )
-  })
-}
-window.addEventListener('message', (event) => {
-  if (event.source !== window || event.origin !== location.origin) return
-  const packet = event.data
-  if (!packet || packet.channel !== channel || typeof packet.ok !== 'boolean') return
-  const request = pending.get(packet.requestId)
-  if (!request) return
-  clearTimeout(request.timer)
-  pending.delete(packet.requestId)
-  if (!packet.ok) request.reject(new Error('unavailable'))
-  else request.resolve(packet.data)
-})
 function text(tag, value) {
   const node = document.createElement(tag)
   node.textContent = value
@@ -326,16 +301,7 @@ function draw(snapshot) {
             propose({ action: 'set-flags', profile: profile.name, [flag]: checked }),
           ),
         )
-      details.append(
-        settings,
-        checkbox(
-          'Keep running here. While on, workspaces with a separate Chrome setup cannot use this profile.',
-          profile.keepRunning === true,
-          `keepRunning:${profile.name}`,
-          (checked) =>
-            propose({ action: 'set-flags', profile: profile.name, keepRunning: checked }),
-        ),
-      )
+      details.append(settings)
       const notes = document.createElement('div')
       notes.className = 'profile-notes'
       notes.append(
@@ -511,6 +477,7 @@ function draw(snapshot) {
   if (focused) refocus(focused)
   if (caret && document.activeElement === renaming?.input)
     renaming.input.setSelectionRange(...caret)
+  window.settingsLoadState.ready()
 }
 // Redraws go through here, so none lands in the middle of a composition.
 function redraw() {
@@ -522,14 +489,15 @@ function show(snapshot) {
   try {
     draw(snapshot)
   } catch {
-    say(UNAVAILABLE, 'warn')
+    window.settingsLoadState.fail()
   }
 }
 async function refresh() {
   try {
-    show(await rpc('read', { surface: 'chrome' }))
+    const snapshot = await rpc('read', { surface: 'chrome' })
+    if (!closed) show(snapshot)
   } catch {
-    say(UNAVAILABLE, 'warn')
+    window.settingsLoadState.fail()
   }
 }
 document.querySelector('#create').addEventListener('submit', (event) => {

@@ -1,24 +1,15 @@
-import { fenceToolDefs, sharedAccess, checkToolAuthorization } from './authorization.js'
-import { PrivateDownloadFiles } from '../browser/privateDownloadFiles.js'
-import { privateFolder } from '../privatePaths.js'
+import { fenceToolDefs, sharedAccess } from './authorization.js'
 import { PublicToolError } from '../shared/toolServer.js'
+import { WindowTargetError } from '../shared/browser/chromiumWindows.js'
+import { LocalFileGuardError } from '../localFileGuard.js'
+import { BrowserNotFoundError, ProfileInUseError } from '../browser/profileBrowser.js'
+import { OperationBlockedError } from '../shared/browser/browser-lease.js'
+import { ProfileInUseElsewhereError } from '../profiles/sharedStore.js'
+import { answerDialog, TabError } from '../tabs.js'
 import { randomBytes } from 'node:crypto'
-import fs from 'node:fs'
-import path from 'node:path'
-import { pipeline } from 'node:stream/promises'
-import { Readable, Transform } from 'node:stream'
-import type { BrowserContext, Download } from 'playwright-core'
 import type { ToolHandler, ToolResult } from '../shared/toolServer.js'
 import { openGuardedFile } from '../localFileGuard.js'
-import {
-  MAX_DOWNLOAD_BYTES,
-  MAX_UPLOAD_FILES,
-  MAX_UPLOAD_TOTAL_BYTES,
-  dayFolder,
-  mimeFor,
-  reserveFile,
-  sanitizeDownloadName,
-} from '../files.js'
+import { MAX_UPLOAD_FILES, MAX_UPLOAD_TOTAL_BYTES, mimeFor } from '../files.js'
 import { MAX_TEXT, ToolError, jsonSchemaOf, parseArgs } from './schema.js'
 import {
   DEFAULT_NETWORK_LIMIT,
@@ -33,6 +24,7 @@ import {
   jsonValue,
   locate,
   onTab,
+  openDialogNote,
   useTab,
   profileName,
   raceTimeout,
@@ -59,7 +51,7 @@ import { buildProfileToolDefs } from './profileTools.js'
 import { buildShowHideDefs } from './showHide.js'
 import { MAX_REOPEN, TITLE_RESERVE_MS, nowMs, reopenTabs } from './modeSwitch.js'
 import { PENDING_DOWNLOAD_MS } from '../tabs.js'
-import type { TabState } from '../tabs.js'
+import { dropPending, fetchToDisk, saveDownload } from './downloads.js'
 import { DESCRIPTION_MAX, ProfileStoreError } from '../profiles/store.js'
 export {
   DEFAULT_TIMEOUT_MS,
@@ -286,6 +278,7 @@ export function buildToolDefs(): ToolDef[] {
               ? ordered.slice(0, MAX_REOPEN).map((t) => ({ id: t.id, url: t.page.url() }))
               : []
           const { generation } = await deps.browser.ensure(name, mode)
+          deps.activity?.('browser-ready')
           usableProfile(deps, name)
           const restored = await reopenTabs(
             deps,
@@ -303,6 +296,7 @@ export function buildToolDefs(): ToolDef[] {
             },
           })
           await deps.browser.usePage(name, page)
+          deps.activity?.('page-ready')
           usableProfile(deps, name)
           const tab = deps.tabs.add(name, generation, page)
           let loadError: string | undefined
@@ -311,8 +305,9 @@ export function buildToolDefs(): ToolDef[] {
               waitUntil: 'domcontentloaded',
               timeout: DEFAULT_TIMEOUT_MS,
             })
+            deps.activity?.('page-loaded')
           } catch (e) {
-            loadError = describeError(e, DEFAULT_TIMEOUT_MS)
+            loadError = openDialogNote(tab) ?? describeError(e)
           }
           const skipped = restored.filter((t) => t.note !== undefined).length
           return {
@@ -320,6 +315,7 @@ export function buildToolDefs(): ToolDef[] {
             windowId: await deps.browser.windowId(name, page),
             url: page.url(),
             title: await titleAfterLoad(page),
+            ...(openDialogNote(tab) ? { dialog: openDialogNote(tab) } : {}),
             ...(loadError ? { loadError } : {}),
             ...(restored.length ? { restoredTabs: restored } : {}),
             ...(openingNote || skipped
@@ -360,6 +356,7 @@ export function buildToolDefs(): ToolDef[] {
               profile: t.profile,
               url: t.page.url(),
               title: await titleOf(t.page),
+              ...(openDialogNote(t) ? { dialog: openDialogNote(t) } : {}),
             })),
           ),
         }
@@ -416,6 +413,7 @@ export function buildToolDefs(): ToolDef[] {
                 : a.action === 'forward'
                   ? await page.goForward(history)
                   : await page.reload(opts)
+          deps.activity?.('page-loaded')
           return {
             url: page.url(),
             title: await titleAfterLoad(page),
@@ -718,7 +716,7 @@ export function buildToolDefs(): ToolDef[] {
         const ms = timeoutOf(a)
         if ((a.scope === 'element') !== (a.ref !== undefined))
           throw new ToolError('scope "element" needs ref, and the other scopes take none')
-        const { value } = await onTab(deps, a.tabId as string, async ({ tab, page }) => {
+        const { value, notes } = await onTab(deps, a.tabId as string, async ({ tab, page }) => {
           const png =
             a.scope === 'element'
               ? await locate(tab, page, a.ref as string).screenshot({
@@ -728,13 +726,14 @@ export function buildToolDefs(): ToolDef[] {
                   fullPage: a.scope === 'full',
                   timeout: ms,
                 })
+          deps.activity?.('screenshot-captured')
           if (png.length > MAX_SCREENSHOT_BYTES)
             throw new ToolError('the screenshot is too large — use scope viewport or element')
           return png
         })
         return {
           image: value,
-          caption: `${a.scope as string} screenshot of ${a.tabId as string}`,
+          caption: `${a.scope as string} screenshot of ${a.tabId as string}${notes.length ? `\nnotes: ${notes.join('; ')}` : ''}`,
         }
       },
     },
@@ -854,7 +853,7 @@ export function buildToolDefs(): ToolDef[] {
       spec: {
         name: 'handle_dialog',
         description:
-          'Say how to answer the next alert/confirm/prompt dialog of this tab (accept or dismiss, with promptText for prompts). If a dialog is already open it is answered now. An unhandled dialog is dismissed after 10 s and reported in the next result.',
+          'Say how to answer the next alert/confirm/prompt dialog of this tab (accept or dismiss, with promptText for prompts). If a dialog is already open it is answered now. An unhandled dialog stays open until explicitly answered; page actions report the open dialog and may be blocked until handle_dialog answers it.',
         props: {
           tabId,
           accept: {
@@ -873,19 +872,11 @@ export function buildToolDefs(): ToolDef[] {
         const tab = await useTab(deps, a.tabId as string)
         deps.tabs.resolve(a.tabId as string, generationOf(deps))
         usableProfile(deps, tab.profile)
-        const pending = tab.pendingDialog
-        if (pending) {
-          tab.pendingDialog = null
-          await (a.accept === true
-            ? pending.accept(a.promptText as string | undefined)
-            : pending.dismiss())
-          return { json: { ok: true, applied: 'to the open dialog' } }
-        }
-        tab.dialogPlan = {
+        const applied = await answerDialog(tab, {
           accept: a.accept === true,
           ...(a.promptText !== undefined ? { promptText: a.promptText as string } : {}),
-        }
-        return { json: { ok: true, applied: 'to the next dialog' } }
+        })
+        return { json: { ok: true, applied: `to the ${applied} dialog` } }
       },
     },
     {
@@ -978,11 +969,25 @@ export function buildToolDefs(): ToolDef[] {
                     }),
             ])
             dropPending(tab, download)
-            return saveDownload(deps, tab.profile, download, ms, startedAt, (file) => {
-              savedFile = file
-            })
+            return saveDownload(
+              deps,
+              tab.profile,
+              download,
+              ms,
+              startedAt,
+              (file) => {
+                savedFile = file
+              },
+              typeof a.timeoutMs === 'number' ? ms : undefined,
+            )
           }
-          return deps.browser.captureDownloads(tab.profile, page, save, () => savedFile)
+          return deps.browser.captureDownloads(
+            tab.profile,
+            page,
+            save,
+            () => savedFile,
+            () => deps.activity?.('download-received'),
+          )
         })
         return withNotes(value, notes)
       },
@@ -1020,13 +1025,28 @@ export function buildToolDefs(): ToolDef[] {
             }))
           dropPending(tab, download)
           return deps.browser.operate(tab.profile, () =>
-            saveDownload(deps, tab.profile, download, ms, startedAt, (file) => {
-              savedFile = file
-            }),
+            saveDownload(
+              deps,
+              tab.profile,
+              download,
+              ms,
+              startedAt,
+              (file) => {
+                savedFile = file
+              },
+              typeof a.timeoutMs === 'number' ? ms : undefined,
+            ),
           )
         }
         return {
-          json: await deps.browser.captureDownloads(tab.profile, tab.page, save, () => savedFile),
+          json: await deps.browser.captureDownloads(
+            tab.profile,
+            tab.page,
+            save,
+            () => savedFile,
+            () => deps.activity?.('download-received'),
+            waiting ? { download: waiting.download, signal: deps.signal } : undefined,
+          ),
         }
       },
     },
@@ -1073,7 +1093,12 @@ export function buildToolDefs(): ToolDef[] {
             await deps.browser.usePage(t.profile, t.page)
             deps.tabs.resolve(t.id, generationOf(deps))
             usableProfile(deps, t.profile)
-            return fetchToDisk(deps, t.page.context(), target, ms)
+            return fetchToDisk(
+              deps,
+              t.page.context(),
+              target,
+              typeof a.timeoutMs === 'number' ? ms : undefined,
+            )
           }),
         }
       },
@@ -1226,212 +1251,6 @@ export function buildToolDefs(): ToolDef[] {
   ])
 }
 export const MAX_PROFILES = 20
-function safeDecode(text: string): string {
-  try {
-    return decodeURIComponent(text)
-  } catch {
-    return text
-  }
-}
-function dropPending(tab: TabState, download: Download): void {
-  tab.pendingDownloads = tab.pendingDownloads.filter((d) => d.download !== download)
-}
-class DownloadTooLarge extends Error {}
-const MAX_REDIRECTS = 10
-async function fetchToDisk(
-  deps: ToolDeps,
-  ctx: BrowserContext,
-  start: string,
-  ms: number,
-): Promise<Record<string, unknown>> {
-  const signal = AbortSignal.timeout(ms)
-  let url = start
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const cookie = (await ctx.cookies(url)).map((c) => `${c.name}=${c.value}`).join('; ')
-    checkToolAuthorization(deps)
-    const res = await fetch(url, {
-      redirect: 'manual',
-      signal,
-      headers: cookie ? { cookie } : {},
-    })
-    try {
-      checkToolAuthorization(deps)
-    } catch (error) {
-      await res.body?.cancel().catch(() => undefined)
-      throw error
-    }
-    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
-      await res.body?.cancel().catch(() => undefined)
-      url = checkDownloadUrl(new URL(res.headers.get('location') as string, url).href)
-      continue
-    }
-    try {
-      if (!res.ok || !res.body) throw new ToolError(`the server answered ${res.status}`)
-      const declared = Number(res.headers.get('content-length'))
-      if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES)
-        throw new ToolError('the file is larger than 200 MB and was not saved')
-      const disposition = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(
-        res.headers.get('content-disposition') ?? '',
-      )?.[1]
-      let urlName = ''
-      try {
-        urlName = decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '')
-      } catch {
-        /* Continue without this optional result. */
-      }
-      const dir = path.join(deps.downloadsRoot, dayFolder((deps.now ?? (() => new Date()))()))
-      privateFolder(path.dirname(deps.downloadsRoot), deps.downloadsRoot, true)
-      privateFolder(deps.downloadsRoot, dir, true)
-      const privateFiles = new PrivateDownloadFiles(deps.downloadsRoot)
-      const { fd, target } = reserveFile(
-        dir,
-        sanitizeDownloadName(disposition ? safeDecode(disposition) : urlName),
-      )
-      let bytes = 0
-      const cap = new Transform({
-        transform(chunk: Buffer, _enc, cb) {
-          try {
-            checkToolAuthorization(deps)
-          } catch (error) {
-            cb(error as Error)
-            return
-          }
-          bytes += chunk.length
-          if (bytes > MAX_DOWNLOAD_BYTES) cb(new DownloadTooLarge())
-          else cb(null, chunk)
-        },
-      })
-      try {
-        await pipeline(
-          Readable.fromWeb(res.body as never),
-          cap,
-          fs.createWriteStream(target, { fd }),
-        )
-        checkToolAuthorization(deps)
-      } catch (e) {
-        privateFiles.remove(target)
-        if (e instanceof DownloadTooLarge)
-          throw new ToolError('the file is larger than 200 MB and was discarded')
-        throw e
-      }
-      return {
-        path: target,
-        bytes,
-        status: res.status,
-        contentType: res.headers.get('content-type'),
-      }
-    } finally {
-      await res.body?.cancel().catch(() => undefined)
-    }
-  }
-  throw new ToolError('too many redirects')
-}
-function chromeNameMatches(wanted: string, found: string): boolean {
-  if (found === wanted) return true
-  const ext = path.extname(wanted)
-  const stem = wanted.slice(0, wanted.length - ext.length)
-  return (
-    found.startsWith(`${stem} (`) &&
-    found.endsWith(`)${ext}`) &&
-    /^\d{1,4}$/.test(found.slice(stem.length + 2, found.length - ext.length - 1))
-  )
-}
-function nativeDownload(
-  deps: ToolDeps,
-  suggested: string,
-  startedAt: number,
-): Record<string, unknown> {
-  const dir = deps.nativeDownloads ?? deps.downloadsRoot
-  privateFolder(deps.downloadsRoot, dir)
-  const privateFiles = new PrivateDownloadFiles(deps.downloadsRoot)
-  let best: {
-    target: string
-    bytes: number
-    mtime: number
-  } | null = null
-  try {
-    for (const f of fs.readdirSync(dir)) {
-      if (!chromeNameMatches(suggested, f)) continue
-      const target = path.join(dir, f)
-      if (!privateFiles.file(target)) continue
-      const st = fs.statSync(target)
-      if (st.isFile() && st.mtimeMs >= startedAt - 2000 && (!best || st.mtimeMs > best.mtime))
-        best = { target, bytes: st.size, mtime: st.mtimeMs }
-    }
-  } catch {
-    /* Continue without this optional result. */
-  }
-  if (!best)
-    throw new ToolError(
-      'Chrome saved the download itself, but the file was not found in the plugin downloads folder',
-    )
-  return { path: best.target, bytes: best.bytes, savedBy: 'chrome' }
-}
-async function saveDownload(
-  deps: ToolDeps,
-  profile: string,
-  download: Download,
-  ms: number,
-  startedAt: number,
-  savedFile?: (file: string) => void,
-): Promise<Record<string, unknown>> {
-  if (
-    deps.browser.downloadIsPrivate &&
-    !(await raceTimeout(deps.browser.downloadIsPrivate(profile, download), ms))
-  )
-    throw new ToolError('the download failed')
-  let tmp: string | null
-  try {
-    tmp = await raceTimeout(download.path(), ms)
-    checkToolAuthorization(deps)
-  } catch (e) {
-    await deps.browser.cancelPrivateDownload?.(profile, download).catch(() => undefined)
-    throw e
-  }
-  if (!tmp) throw new ToolError('the download failed')
-  if (!fs.existsSync(tmp)) return nativeDownload(deps, download.suggestedFilename(), startedAt)
-  if (deps.browser.downloadFileIsPrivate?.(profile, tmp) === false)
-    throw new ToolError('the download failed')
-  const tooLarge = new ToolError('the download is larger than 200 MB and was discarded')
-  let copied = false
-  try {
-    if (fs.statSync(tmp).size > MAX_DOWNLOAD_BYTES) throw tooLarge
-    const source = await download.createReadStream()
-    checkToolAuthorization(deps)
-    if (!source) throw new ToolError('the download failed')
-    const dir = path.join(deps.downloadsRoot, dayFolder((deps.now ?? (() => new Date()))()))
-    privateFolder(path.dirname(deps.downloadsRoot), deps.downloadsRoot, true)
-    privateFolder(deps.downloadsRoot, dir, true)
-    const privateFiles = new PrivateDownloadFiles(deps.downloadsRoot)
-    const { fd, target } = reserveFile(dir, sanitizeDownloadName(download.suggestedFilename()))
-    let bytes = 0
-    const cap = new Transform({
-      transform(chunk: Buffer, _enc, cb) {
-        try {
-          checkToolAuthorization(deps)
-        } catch (error) {
-          cb(error as Error)
-          return
-        }
-        bytes += chunk.length
-        if (bytes > MAX_DOWNLOAD_BYTES) cb(new DownloadTooLarge())
-        else cb(null, chunk)
-      },
-    })
-    try {
-      await pipeline(source, cap, fs.createWriteStream(target, { fd }))
-      checkToolAuthorization(deps)
-    } catch (e) {
-      privateFiles.remove(target)
-      throw e instanceof DownloadTooLarge ? tooLarge : e
-    }
-    savedFile?.(tmp)
-    copied = true
-    return { path: target, bytes }
-  } finally {
-    if (copied) await deps.browser.deletePrivateDownload?.(profile, download).catch(() => undefined)
-  }
-}
 export function allToolDefs(): ToolDef[] {
   return [...buildToolDefs(), ...buildProfileToolDefs(), ...buildShowHideDefs()]
 }
@@ -1452,12 +1271,14 @@ export function createAgentChromeTools(deps: ToolDeps): ToolHandler[] {
       description: fill(def.spec.description),
       inputSchema: jsonSchemaOf(def.spec),
     },
-    async execute(rawArgs): Promise<ToolResult> {
-      let ms: number | undefined
+    async execute(rawArgs, context): Promise<ToolResult> {
       try {
         const args = parseArgs(def.spec, rawArgs)
-        ms = typeof args.timeoutMs === 'number' ? args.timeoutMs : undefined
-        const out = await def.run(args, deps)
+        const out = await def.run(args, {
+          ...deps,
+          signal: context.signal,
+          activity: context.activity,
+        })
         if ('image' in out) {
           return {
             content: [
@@ -1479,7 +1300,19 @@ export function createAgentChromeTools(deps: ToolDeps): ToolHandler[] {
           ],
         }
       } catch (e) {
-        throw new PublicToolError(describeError(e, ms ?? DEFAULT_TIMEOUT_MS))
+        if (
+          e instanceof WindowTargetError ||
+          e instanceof ToolError ||
+          e instanceof TabError ||
+          e instanceof LocalFileGuardError ||
+          e instanceof ProfileInUseError ||
+          e instanceof ProfileInUseElsewhereError ||
+          e instanceof BrowserNotFoundError
+        )
+          throw new PublicToolError(e.message)
+        if (e instanceof OperationBlockedError)
+          throw new PublicToolError('the profile is being restarted — call again in a few seconds')
+        throw e
       }
     },
   }))

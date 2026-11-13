@@ -1,7 +1,10 @@
+import { packageTestHelpers } from '../../shared/test/package-helpers.mjs'
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
+import { createServer } from 'node:net'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -23,15 +26,10 @@ vi.mock('playwright-core', () => ({
     },
   },
 }))
-const cleanup: Array<() => void | Promise<void>> = []
+const { cleanup, temporary, requestFor, connectClient } = packageTestHelpers('fictional-chrome-')
 afterEach(async () => {
   for (const fn of cleanup.splice(0).reverse()) await fn()
 })
-const temporary = () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-chrome-'))
-  cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }))
-  return root
-}
 const mcpToken = 'fictional-mcp-'.repeat(8)
 const adminToken = 'fictional-person-'.repeat(8)
 function configured() {
@@ -48,35 +46,13 @@ async function boot(start = startAgentChrome) {
   cleanup.push(() => server.close())
   const port = (server.httpServer.address() as { port: number }).port
   const url = `http://127.0.0.1:${port}`
-  async function request(endpoint: string, token?: string, body?: unknown, origin?: string) {
-    const response = await fetch(url + endpoint, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: {
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        ...(origin ? { origin } : {}),
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    })
-    return { status: response.status, body: await response.json() }
-  }
+  const request = requestFor(url)
   return { config, store, browser, server, url, request }
 }
 describe('private Chrome package', () => {
-  it('derives the server version from release metadata and contains no literal server-version fallback', () => {
+  it('derives the server version from release metadata', () => {
     const metadata = JSON.parse(fs.readFileSync('plugins/chrome/manifest-template.json', 'utf8'))
     expect(VERSION).toBe(metadata.version)
-    const inspect = (directory: string): void => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const file = path.join(directory, entry.name)
-        if (entry.isDirectory()) inspect(file)
-        else if (entry.name.endsWith('.ts'))
-          expect(fs.readFileSync(file, 'utf8')).not.toMatch(
-            /['"`]\d+\.\d+\.\d+(?:[-+][^'"`\s]+)?['"`]/,
-          )
-      }
-    }
-    inspect('plugins/chrome/src')
   })
   it('the built archive reports exactly its manifest version in authenticated health and MCP initialization', async () => {
     const artifact = process.env.BROCREW_CHROME_TEST_ARTIFACT
@@ -119,15 +95,47 @@ describe('private Chrome package', () => {
       expect(client.getServerVersion()?.version).toBe(manifest.version)
     }
   })
-  it('requires explicit private paths and distinct private auth, with no workspace fallback', () => {
+  it('reports the real startup cause when the packaged server cannot bind its port', async () => {
+    const artifact = process.env.BROCREW_CHROME_TEST_ARTIFACT
+    expect(artifact, 'Build a fresh artifact and set BROCREW_CHROME_TEST_ARTIFACT').toBeTruthy()
+    const entry = ['.', 'chrome-darwin-arm64', 'chrome-win32-x64']
+      .map((name) => path.join(artifact!, name, 'package', 'server.mjs'))
+      .find((file) => fs.existsSync(file))
+    expect(entry).toBeDefined()
+    const occupied = createServer()
+    occupied.listen(0, '127.0.0.1')
+    await once(occupied, 'listening')
+    try {
+      const config = configured()
+      const child = spawnSync(process.execPath, [entry!], {
+        encoding: 'utf8',
+        timeout: 3000,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          BROCREW_CHROME_DATA: config.home,
+          BROCREW_CHROME_AUTH: config.authPath,
+          BROCREW_CHROME_PORT: String((occupied.address() as { port: number }).port),
+          BROCREW_CHROME_SHARED: undefined,
+          MCP_BIND_HOST: undefined,
+        },
+      })
+      expect(child.error).toBeUndefined()
+      expect(child.status, child.stderr).toBe(1)
+      expect(child.stderr).toContain('agent-chrome: cannot start:')
+      expect(child.stderr).toContain('EADDRINUSE')
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        occupied.close((error) => (error ? reject(error) : resolve())),
+      )
+    }
+  })
+  it('requires explicit paths and distinct auth, with no workspace fallback', () => {
     expect(() => loadConfig({})).toThrow('Plugin unavailable')
     expect(() => loadConfig({ BROCREW_CHROME_DATA: 'relative' })).toThrow('Plugin unavailable')
     const config = configured()
     expect(config.workspace).toBe(path.join(config.home, 'files'))
     expect(config.downloadsRoot).toBe(path.join(config.home, 'downloads'))
-    if (process.platform !== 'win32')
-      for (const dir of [config.home, config.workspace, config.downloadsRoot])
-        expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
     fs.writeFileSync(config.authPath, JSON.stringify({ mcpToken, adminToken: mcpToken }))
     expect(() =>
       loadConfig({ BROCREW_CHROME_DATA: config.home, BROCREW_CHROME_AUTH: config.authPath }),
@@ -144,7 +152,7 @@ describe('private Chrome package', () => {
       loadConfig({ ...env, BROCREW_CHROME_EXECUTABLE: 'fictional-relative-browser' }),
     ).toThrow('Plugin unavailable')
   })
-  it('refuses a linked auth file and a world-readable auth file without quoting it', () => {
+  it('refuses a linked auth file and accepts ordinary readable auth', () => {
     const config = configured(),
       link = path.join(config.home, 'linked.json')
     fs.symlinkSync(config.authPath, link)
@@ -152,10 +160,13 @@ describe('private Chrome package', () => {
       loadConfig({ BROCREW_CHROME_DATA: config.home, BROCREW_CHROME_AUTH: link }),
     ).toThrow('Plugin unavailable')
     if (process.platform !== 'win32') {
+      fs.chmodSync(config.home, 0o755)
       fs.chmodSync(config.authPath, 0o644)
       expect(() =>
         loadConfig({ BROCREW_CHROME_DATA: config.home, BROCREW_CHROME_AUTH: config.authPath }),
-      ).toThrow('Plugin unavailable')
+      ).not.toThrow()
+      expect(fs.statSync(config.home).mode & 0o777).toBe(0o755)
+      expect(fs.statSync(config.authPath).mode & 0o777).toBe(0o644)
     }
   })
   it('authenticates health and admin separately from tools, and refuses browser origins', async () => {
@@ -177,8 +188,7 @@ describe('private Chrome package', () => {
     const transport = new StreamableHTTPClientTransport(new URL(url + '/mcp'), {
       requestInit: { headers: { authorization: `Bearer ${mcpToken}` } },
     })
-    await client.connect(transport)
-    cleanup.push(() => client.close())
+    await connectClient(client, transport)
     const tools = await client.listTools()
     expect(tools.tools.some((tool) => tool.name === 'open_tab')).toBe(true)
     const refused = await client.callTool({

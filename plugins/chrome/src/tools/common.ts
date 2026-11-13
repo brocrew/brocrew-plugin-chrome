@@ -1,21 +1,18 @@
 import { navigationUrl } from '../shared/browser/navigationUrl.js'
-import { WindowTargetError } from '../shared/browser/chromiumWindows.js'
 import type { Locator, Page } from 'playwright-core'
-import { LocalFileGuardError } from '../localFileGuard.js'
 import type { LocalFileGuardConfig } from '../localFileGuard.js'
 import type { ProfileBrowser } from '../browser/profileBrowser.js'
-import { BrowserNotFoundError, ProfileInUseError } from '../browser/profileBrowser.js'
-import { OperationBlockedError } from '../shared/browser/browser-lease.js'
 import type { KeyedSerializer } from '../shared/browser/browser-lease.js'
 import { isProfileName } from '../profiles/store.js'
 import type { ProfileStore } from '../profiles/store.js'
-import { ProfileInUseElsewhereError } from '../profiles/sharedStore.js'
-import { TabError } from '../tabs.js'
-import type { TabRegistry, TabState } from '../tabs.js'
+import { TabError, type TabRegistry, type TabState } from '../tabs.js'
 import type { WindowTasks } from '../windows.js'
 import { MAX_TEXT, ToolError } from './schema.js'
+import type { ToolActivity } from '../shared/toolServer.js'
 import type { PropSpec, ToolSpec } from './schema.js'
 export interface ToolDeps {
+  signal?: AbortSignal
+  activity?: (stage: ToolActivity) => void
   store: ProfileStore
   browser: ProfileBrowser
   windows: WindowTasks
@@ -151,37 +148,8 @@ export function jsonValue(value: unknown): string {
   if (text === undefined) text = 'null'
   return capped(text)
 }
-export function describeError(e: unknown, ms?: number): string {
-  if (
-    e instanceof WindowTargetError ||
-    e instanceof ToolError ||
-    e instanceof TabError ||
-    e instanceof LocalFileGuardError
-  )
-    return e.message
-  if (
-    e instanceof ProfileInUseError ||
-    e instanceof ProfileInUseElsewhereError ||
-    e instanceof BrowserNotFoundError
-  )
-    return e.message
-  if (e instanceof OperationBlockedError)
-    return 'the profile is being restarted — call again in a few seconds'
-  const name = e instanceof Error ? e.name : ''
-  if (name === 'TimeoutError') return `timed out${ms ? ` after ${ms} ms` : ''}`
-  const text = e instanceof Error ? e.message : ''
-  if (/Target (page, context or browser|closed)|has been closed/i.test(text))
-    return 'the page or the browser was closed during the action'
-  if (/strict mode violation/i.test(text))
-    return 'the ref matches more than one element — call snapshot again'
-  if (
-    /not an <input>|Element is not|not a select|is not editable|not visible|intercepts pointer events|not enabled|detached/i.test(
-      text,
-    )
-  )
-    return 'the element cannot take this action right now'
-  if (/net::|ERR_/.test(text)) return 'the page could not be loaded'
-  return `the browser action failed${name ? ` (${name.replace(/[^\w]/g, '').slice(0, 30)})` : ''}`
+export function describeError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
 }
 /** Page-tool use which is not routed through onTab still updates context window preference. */
 export async function useTab(deps: ToolDeps, id: string): Promise<TabState> {
@@ -201,6 +169,15 @@ export interface TabCall {
   tab: TabState
   page: Page
 }
+export function openDialogNote(tab: TabState): string | undefined {
+  const dialog = tab.pendingDialog
+  if (!dialog) return undefined
+  return `tab ${tab.id} has an open ${dialog.type()} dialog: ${JSON.stringify(dialog.message().slice(0, 2000))} — call handle_dialog with tabId ${tab.id} and accept true or false to answer it`
+}
+function requireNoDialog(tab: TabState): void {
+  const note = openDialogNote(tab)
+  if (note) throw new TabError(note)
+}
 export async function onTab<T>(
   deps: ToolDeps,
   id: string,
@@ -211,18 +188,32 @@ export async function onTab<T>(
 }> {
   const tab = deps.tabs.resolve(id, generationOf(deps))
   usableProfile(deps, tab.profile)
+  requireNoDialog(tab)
   deps.browser.touch(tab.profile)
   const value = await deps.browser.operate(tab.profile, () =>
     deps.serializer.runExclusive(tab.id, async () => {
       deps.tabs.resolve(id, generationOf(deps))
       usableProfile(deps, tab.profile)
+      requireNoDialog(tab)
       await deps.browser.usePage(tab.profile, tab.page)
+      deps.activity?.('page-ready')
       deps.tabs.resolve(id, generationOf(deps))
       usableProfile(deps, tab.profile)
-      return fn({ tab, page: tab.page })
+      requireNoDialog(tab)
+      try {
+        return await fn({ tab, page: tab.page })
+      } catch (error) {
+        const note = openDialogNote(tab)
+        if (note)
+          throw new TabError(`${note}. The action's completion is unknown; do not replay it.`)
+        throw error
+      }
     }),
   )
-  return { value, notes: tab.notes.splice(0) }
+  const notes = tab.notes.splice(0)
+  const dialog = openDialogNote(tab)
+  if (dialog) notes.push(dialog)
+  return { value, notes }
 }
 export function withNotes(
   json: Record<string, unknown>,

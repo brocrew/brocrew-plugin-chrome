@@ -2,48 +2,16 @@ import fs from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { privateFolder } from '../privatePaths.js'
-import type { SharedProfileAccess } from './sharedTypes.js'
-import { PRIVATE } from '../privateModes.js'
+import type { CreatedBy, HelperSwitch, ProfileRecord, SharedProfileAccess } from './sharedTypes.js'
+import { writeAtomicallySync } from '../../../shared/atomic-file.js'
 export const PROFILE_NAME = /^[a-z0-9-]{1,32}$/
 export interface ProfileFlags {
   enabled: boolean
   allowExtensions: boolean
   allowSettings: boolean
   allowSync: boolean
-  keepRunning: boolean
 }
-export const FLAG_NAMES = [
-  'enabled',
-  'allowExtensions',
-  'allowSettings',
-  'allowSync',
-  'keepRunning',
-] as const
-export type CreatedBy = 'agent' | 'panel'
-export interface ProfileRecord {
-  /** Local capability-mode epoch; persisted with flags so failed registry writes cannot admit ABA. */
-  authorizationEpoch?: string
-  name: string
-  /** Person-facing label only; name remains the immutable storage/tool key. */
-  displayName?: string
-  deleting?: boolean
-  enabled: boolean
-  allowExtensions: boolean
-  allowSettings: boolean
-  allowSync: boolean
-  keepRunning: boolean
-  createdAt: string
-  createdBy: CreatedBy
-  description: string
-  temporary: boolean
-  /**
-   * The person's switch for the BroCrew helper. off: never loaded until they turn it on.
-   * turning-on: they pressed Turn on, which beats Chrome's older record of the switch until the
-   * helper is running again.
-   */
-  helper: HelperSwitch
-}
-export type HelperSwitch = 'on' | 'off' | 'turning-on'
+export const FLAG_NAMES = ['enabled', 'allowExtensions', 'allowSettings', 'allowSync'] as const
 export const DESCRIPTION_MAX = 500
 // eslint-disable-next-line no-control-regex -- Refuse control characters in profile labels.
 const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/
@@ -56,6 +24,18 @@ export function checkDescription(value: unknown): string {
   return text
 }
 export class ProfileStoreError extends Error {}
+export class ProfileInUseElsewhereError extends ProfileStoreError {
+  readonly transient = true
+  constructor(
+    readonly label: string,
+    profile?: string,
+    hostPid?: number,
+  ) {
+    super(
+      `Chrome profile${profile === undefined ? '' : ` "${profile}"`} is in use in ${label === 'the default workspaces' ? label : `the ${label} workspace`} right now. ${hostPid === undefined ? '' : `Recorded plugin host PID: ${hostPid}. `}Use another profile, or ask the person to close the owning profile's browser there. You can retry after the owning profile's browser closes. A new window cannot bypass this owner.`,
+    )
+  }
+}
 export const RENAME_ERRORS = {
   invalid: 'Profile name must be 1–60 characters.',
   duplicate: 'Another profile already uses that name.',
@@ -117,7 +97,6 @@ export function createProfileStore(opts: {
   const file = path.join(opts.home, 'profiles.json')
   const profilesDir = path.join(opts.home, 'profiles')
   privateFolder(opts.home, profilesDir, true)
-  if (PRIVATE.dir !== undefined) fs.chmodSync(opts.home, PRIVATE.dir)
   const readFile = (): { defaults: number; profiles: ProfileRecord[] } => {
     let text: string
     try {
@@ -149,7 +128,6 @@ export function createProfileStore(opts: {
           allowExtensions: p.allowExtensions === true,
           allowSettings: p.allowSettings === true,
           allowSync: p.allowSync === true,
-          keepRunning: p.keepRunning === true,
           createdAt: typeof p.createdAt === 'string' ? p.createdAt : '',
           createdBy: p.createdBy === 'panel' ? 'panel' : 'agent',
           description:
@@ -164,15 +142,10 @@ export function createProfileStore(opts: {
   }
   const read = (): ProfileRecord[] => readFile().profiles
   const write = (profiles: ProfileRecord[]): void => {
-    const tmp = path.join(opts.home, `.profiles.${process.pid}.${Date.now()}.tmp`)
-    fs.writeFileSync(
-      tmp,
+    writeAtomicallySync(
+      file,
       JSON.stringify({ defaults: DEFAULTS_VERSION, profiles }, null, 2) + '\n',
-      {
-        mode: PRIVATE.file,
-      },
     )
-    fs.renameSync(tmp, file)
   }
   try {
     const stored = readFile()
@@ -221,7 +194,6 @@ export function createProfileStore(opts: {
         allowExtensions: !temporary,
         allowSettings: false,
         allowSync: !temporary,
-        keepRunning: false,
         createdAt: now().toISOString(),
         createdBy,
         description,

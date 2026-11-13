@@ -6,9 +6,8 @@ import { startAgentChrome } from './app.js'
 import type { RunningAgentChrome } from './app.js'
 import { ChromeBrowser } from './browser/chromeBrowser.js'
 import type { ChromeBrowserOptions } from './browser/chromeBrowser.js'
-import { ConfigError, loadConfig } from './config.js'
+import { loadConfig } from './config.js'
 import type { AgentChromeConfig } from './config.js'
-import { restoreFileOf, restoreVisibleSession, saveVisibleSession } from './restoreSession.js'
 import { createLogger } from './logger.js'
 import type { Logger } from './logger.js'
 import { createProfileStore } from './profiles/store.js'
@@ -36,10 +35,6 @@ export function createChromeBrowser(
     helperFor: (name) => store.get(name)?.helper ?? 'on',
     rememberHelper: (name, helper) => {
       if (store.get(name) && store.get(name)?.helper !== helper) store.setHelper(name, helper)
-    },
-    keepRunningFor: (name) => {
-      const r = store.get(name)
-      return r?.keepRunning === true && !r.temporary
     },
     afterIdleClose: (name) => {
       if (store.get(name)?.temporary) {
@@ -86,7 +81,7 @@ async function main(): Promise<void> {
     running = await startAgentChrome(config, { browser, store, logger })
   } catch (e) {
     process.stderr.write(
-      `agent-chrome: cannot start: ${e instanceof ConfigError ? e.message : e instanceof Error ? e.name : 'unknown error'}\n`,
+      `agent-chrome: cannot start: ${e instanceof Error ? e.message : 'unknown error'}\n`,
     )
     process.exit(1)
   }
@@ -97,30 +92,8 @@ async function main(): Promise<void> {
       type: 'listening',
       port: (running.httpServer.address() as { port: number }).port,
     })
-  const restoreFile = restoreFileOf(config.home)
-  installShutdownSignals({
-    closeAll: async () => {
-      saveVisibleSession(
-        restoreFile,
-        browser,
-        (name) => {
-          const r = store.get(name)
-          return r !== undefined && r.enabled && !r.temporary
-        },
-        undefined,
-        logger,
-        store.shared ? (name) => store.shared!.identity(name) : undefined,
-      )
-      await browser.closeAll()
-    },
-  })
-  void restoreVisibleSession({
-    file: restoreFile,
-    store,
-    browser,
-    tabs: running.tabs,
-    logger,
-  }).catch(() => logger.warn('restore: failed'))
+  // A restart reopens nothing: the person and agents open Chrome profiles when they need them.
+  installShutdownSignals({ closeAll: () => browser.closeAll() })
   process.on('unhandledRejection', (e) =>
     logger.error('unhandled rejection', { errorName: e instanceof Error ? e.name : typeof e }),
   )

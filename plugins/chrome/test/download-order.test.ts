@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { afterEach, expect, it, vi } from 'vitest'
 import type { BrowserContext, Page } from 'playwright-core'
 import { FakeDownload, harness } from './fakes.js'
-import { buildToolDefs } from '../src/tools/index.js'
+import { buildToolDefs, createAgentChromeTools } from '../src/tools/index.js'
 import { ChromeBrowser } from '../src/browser/chromeBrowser.js'
 const fixtures: ReturnType<typeof harness>[] = []
 const routedBrowsers: ChromeBrowser[] = []
@@ -171,6 +171,96 @@ it('retains an earlier visible-window download without waiting for another event
 })
 
 it.each([false, true])(
+  'observes an earlier GUID without taking its capture ownership (cancelled=%s)',
+  async (cancelled) => {
+    const f = await routed()
+    const ownerReady = Promise.withResolvers<void>()
+    const ownerRelease = Promise.withResolvers<void>()
+    const ownerProgress = vi.fn()
+    const original = f.routedBrowser.captureDownloads(
+      'fern',
+      f.page as never,
+      async () => {
+        f.begin('earlier-guid', 'earlier.txt')
+        await flush()
+        ownerReady.resolve()
+        await ownerRelease.promise
+      },
+      undefined,
+      ownerProgress,
+    )
+    await ownerReady.promise
+    const download = new FakeDownload(
+      'earlier.txt',
+      Buffer.from('fresh bytes'),
+      path.join(f.stage, 'earlier-guid'),
+    )
+    const pathReady = Promise.withResolvers<void>()
+    const pathRelease = Promise.withResolvers<void>()
+    vi.spyOn(download, 'path').mockImplementation(async () => {
+      pathReady.resolve()
+      await pathRelease.promise
+      return download.file
+    })
+    const tab = f.h.tabs.resolve(f.tabId, (name) => f.h.browser.state(name)?.generation ?? null)
+    tab.pendingDownloads.push({ download: download as never, at: Date.now() })
+    const activity = vi.fn()
+    const cancellation = new AbortController()
+    const tool = createAgentChromeTools(f.h.deps).find(
+      (entry) => entry.definition.name === 'wait_for_download',
+    )!
+    const waiting = tool.execute({ tabId: f.tabId }, { activity, signal: cancellation.signal })
+    try {
+      await pathReady.promise
+      f.begin('unrelated-guid', 'unrelated.txt')
+      await flush()
+      for (const bytes of [2, 2, 1, 5])
+        f.session.emit('Browser.downloadProgress', {
+          guid: 'earlier-guid',
+          state: 'inProgress',
+          receivedBytes: bytes,
+          totalBytes: 11,
+        })
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'unrelated-guid',
+        state: 'inProgress',
+        receivedBytes: 6,
+        totalBytes: 11,
+      })
+      const count = activity.mock.calls.filter(([stage]) => stage === 'download-received').length
+      expect(ownerProgress).toHaveBeenCalledTimes(2)
+      expect(count).toBe(2)
+      if (cancelled) {
+        cancellation.abort()
+        f.session.emit('Browser.downloadProgress', {
+          guid: 'earlier-guid',
+          state: 'inProgress',
+          receivedBytes: 6,
+          totalBytes: 11,
+        })
+        expect(activity.mock.calls.filter(([stage]) => stage === 'download-received')).toHaveLength(
+          count,
+        )
+      }
+    } finally {
+      pathRelease.resolve()
+      await waiting
+      const afterSave = activity.mock.calls.length
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'earlier-guid',
+        state: 'inProgress',
+        receivedBytes: 8,
+        totalBytes: 11,
+      })
+      expect(activity).toHaveBeenCalledTimes(afterSave)
+      expect(ownerProgress).toHaveBeenCalledTimes(cancelled ? 4 : 3)
+      ownerRelease.resolve()
+      await original
+    }
+  },
+)
+
+it.each([false, true])(
   'saving a queued download preserves a fresh user download (completed before save=%s)',
   async (completed) => {
     const f = await routed()
@@ -232,6 +322,61 @@ it('releases a fresh claim after saving that same download', async () => {
   })
 })
 
+it('reports owned advancing bytes and lets a default download outlast the action budget', async () => {
+  const f = await routed()
+  const file = path.join(f.stage, 'activity-guid')
+  const download = new FakeDownload('fresh.txt', Buffer.from('fresh bytes'), file)
+  const ready = Promise.withResolvers<void>()
+  const saved = Promise.withResolvers<string>()
+  download.path = () => {
+    ready.resolve()
+    return saved.promise
+  }
+  const stages: string[] = []
+  f.page.goto = vi.fn(async () => {
+    f.begin('activity-guid')
+    await flush()
+    for (const receivedBytes of [5, 5, 4, 11])
+      f.session.emit('Browser.downloadProgress', {
+        guid: 'activity-guid',
+        receivedBytes,
+        totalBytes: 11,
+        state: 'inProgress',
+      })
+    expect(stages).toEqual(['page-ready', 'download-received', 'download-received'])
+    f.page.emit('download', download)
+    return { status: () => 200 }
+  })
+  const tool = createAgentChromeTools(f.h.deps).find((one) => one.definition.name === 'download')!
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  let ended = false
+  const pending = tool.execute(
+    { tabId: f.tabId, url: 'https://fictional.invalid/fresh.txt' },
+    { activity: (stage) => stages.push(stage) },
+  )
+  void pending.then(
+    () => {
+      ended = true
+    },
+    () => {
+      ended = true
+    },
+  )
+  try {
+    await ready.promise
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(ended).toBe(false)
+    f.complete('activity-guid')
+    saved.resolve(file)
+    await pending
+    expect(stages.at(-1)).toBe('download-saved')
+  } finally {
+    saved.resolve(file)
+    vi.useRealTimers()
+    await pending.catch(() => undefined)
+  }
+})
+
 it('keeps a user download when the wait times out before receiving its event', async () => {
   const f = await routed()
   const armed = Promise.withResolvers<void>()
@@ -241,7 +386,7 @@ it('keeps a user download when the wait times out before receiving its event', a
     return event.promise
   })
   const failed = expect(f.h.call('wait_for_download', { tabId: f.tabId })).rejects.toThrow(
-    'timed out',
+    'fictional timeout',
   )
   await armed.promise
   f.begin('fresh-guid')
