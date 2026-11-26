@@ -1,7 +1,7 @@
 {
   "format": 2,
   "id": "chrome",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "sourceCommit": "2618dab1b1e3672bdddae5ed771a0ecf84e0002e",
   "platforms": [
     {
@@ -13,10 +13,7 @@
     "major": 1,
     "minMinor": 0,
     "maxMinor": 0,
-    "requiredFeatures": [
-      "contributions-v1",
-      "shared-data-v1"
-    ]
+    "requiredFeatures": ["contributions-v1", "shared-data-v1"]
   },
   "toolApi": {
     "major": 1,
@@ -80,15 +77,11 @@
         "properties": {
           "surface": {
             "type": "string",
-            "enum": [
-              "chrome"
-            ],
+            "enum": ["chrome"],
             "maxLength": 6
           }
         },
-        "required": [
-          "surface"
-        ],
+        "required": ["surface"],
         "additionalProperties": false
       },
       "subscribe": {
@@ -96,15 +89,11 @@
         "properties": {
           "surface": {
             "type": "string",
-            "enum": [
-              "chrome"
-            ],
+            "enum": ["chrome"],
             "maxLength": 6
           }
         },
-        "required": [
-          "surface"
-        ],
+        "required": ["surface"],
         "additionalProperties": false
       },
       "unsubscribe": {
@@ -115,9 +104,7 @@
             "maxLength": 64
           }
         },
-        "required": [
-          "subscriptionId"
-        ],
+        "required": ["subscriptionId"],
         "additionalProperties": false
       },
       "proposeConfig": {
@@ -165,10 +152,7 @@
             "type": "boolean"
           }
         },
-        "required": [
-          "action",
-          "profile"
-        ],
+        "required": ["action", "profile"],
         "additionalProperties": false
       }
     },
@@ -254,9 +238,7 @@
     "minSchema": 1,
     "maxSchema": 1
   },
-  "authors": [
-    "brocrew"
-  ],
+  "authors": ["brocrew"],
   "executor": {
     "kind": "node",
     "entry": "server.mjs"

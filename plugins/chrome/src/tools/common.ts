@@ -148,7 +148,7 @@ export async function useTab(deps: ToolDeps, id: string): Promise<TabState> {
   await deps.browser.operate(tab.profile, async () => {
     deps.tabs.resolve(id, generationOf(deps))
     usableProfile(deps, tab.profile)
-    await deps.browser.usePage(tab.profile, tab.page)
+    await deps.browser.usePage(tab.profile, tab.page, deps.signal)
     deps.tabs.resolve(id, generationOf(deps))
     usableProfile(deps, tab.profile)
   })
@@ -184,7 +184,7 @@ export async function onTab<T>(
       deps.tabs.resolve(id, generationOf(deps))
       usableProfile(deps, tab.profile)
       requireNoDialog(tab)
-      if (waitForWindow) await deps.browser.usePage(tab.profile, tab.page)
+      if (waitForWindow) await deps.browser.usePage(tab.profile, tab.page, deps.signal)
       else {
         const notes = tab.notes
         void deps.browser.usePage(tab.profile, tab.page).catch((error: unknown) => {
@@ -237,6 +237,19 @@ export async function titleAfterLoad(page: Page): Promise<string> {
   await new Promise((r) => setTimeout(r, 400))
   return titleOf(page)
 }
+export async function cacheTabTitle(tab: TabState, readTitle = titleOf): Promise<string> {
+  const revision = tab.navigationRevision
+  const publication = tab.titlePublication
+  const title = await readTitle(tab.page)
+  if (
+    tab.navigationRevision === revision &&
+    (tab.titlePublication === publication || (title && !tab.title))
+  ) {
+    tab.title = title
+    tab.titlePublication++
+  }
+  return title
+}
 export async function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -255,6 +268,7 @@ export async function raceTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 }
 export interface ToolDef {
   spec: ToolSpec
+  downloadRouting?: false
   run(args: Record<string, unknown>, deps: ToolDeps): Promise<ToolOutput>
 }
 export function pageText(
